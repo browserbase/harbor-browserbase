@@ -20,3 +20,8 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["bb_harbor"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra"

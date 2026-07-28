@@ -1,0 +1,28 @@
+# Custom environment, agent, and verifier implementations belong in this job-level
+# config because task.toml cannot wire their import paths.
+# Harbor's scrubber does not match BROWSERBASE_PROJECT_ID or the signed connect URL
+# (its key regex is KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH), so strip the
+# trajectory directory separately before sharing trial output.
+job_name: browserbase-wtb-smoke
+jobs_dir: jobs
+n_concurrent_trials: 2
+
+tasks:
+  - path: tasks/wtb-smoke
+
+environment:
+  import_path: bb_harbor.env:BrowserbaseEnvironment
+
+agents:
+  - import_path: bb_harbor.agent:StagehandAgent
+    model_name: google/gemini-3-flash-preview
+    kwargs:
+      mode: dom
+    env:
+      BROWSERBASE_API_KEY: ${BROWSERBASE_API_KEY}
+      BROWSERBASE_PROJECT_ID: ${BROWSERBASE_PROJECT_ID}
+
+verifier:
+  import_path: bb_harbor.verifier:StagehandVerifier
+  kwargs:
+    judge_model: google/gemini-3-flash-preview
