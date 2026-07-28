@@ -12,11 +12,15 @@ that reverse mapping is lossy and can silently select the wrong eval.
 
 Container variables are applied with ``BaseEnvironment.scoped_exec_env`` and
 never by mutating host ``os.environ``.  Harbor may run trials concurrently in
-one process, making process-global mutation unsafe.  Browserbase credentials
-must be supplied through the agent's ``extra_env``, not ``[environment].env``:
+one process, making process-global mutation unsafe.  Browserbase and model-provider
+credentials must be supplied through the agent's ``extra_env``, not
+``[environment].env``:
 ``Trial._scrub_jobs_dir`` collects secrets from ``agent.extra_env`` (and the
-task/run verifier envs), but not from environment env, so only the former lets
-Harbor scrub a leaked key from the jobs directory.
+task/run verifier envs), but not from environment env. Because
+``BROWSERBASE_API_KEY`` matches Harbor's sensitive-key regex, its value is
+redacted even when embedded in a signed connect URL. ``BROWSERBASE_PROJECT_ID``
+does not match and survives verbatim; stripping it from shared jobs output is an
+operator responsibility and a known gap.
 
 The CLI currently replaces a caller-provided ``EVAL_TRAJECTORY_GROUP`` with a
 run-tokenized group.  This agent still supplies the requested session-derived
@@ -60,15 +64,25 @@ _TASK_ID_RE: Final[re.Pattern[str]] = re.compile(
 )
 _FULL_TASK_ID_RE: Final[re.Pattern[str]] = re.compile(rf"^{_TASK_ID_VALUE}$")
 _TASK_ID_MARKER: Final[str] = "stagehand-task-id: <task-id>"
+# Stagehand core utils.ts ~690 defines all Google aliases in this precedence;
+# v3Evaluator.ts ~76 directly consumes the first two for verifier judging.
+_FORWARDED_EXTRA_ENV_NAMES: Final[tuple[str, ...]] = (
+    "BROWSERBASE_API_KEY",
+    "BROWSERBASE_PROJECT_ID",
+    "GEMINI_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "GOOGLE_API_KEY",
+)
 
 
 class StagehandAgent(BaseAgent):
     """Drive one Stagehand eval inside a Harbor-managed container.
 
-    Put ``BROWSERBASE_API_KEY`` and ``BROWSERBASE_PROJECT_ID`` in the agent's
-    ``extra_env``.  In addition to safely scoping them to agent execution, this
-    is the only relevant Harbor configuration source whose secret values are
-    included by ``Trial._scrub_jobs_dir``; ``[environment].env`` is not scanned.
+    Put Browserbase credentials and the selected model provider key in the
+    agent's ``extra_env``. In addition to safely scoping them to agent execution,
+    this lets ``Trial._scrub_jobs_dir`` redact values whose key names are
+    sensitive; ``[environment].env`` is not scanned. The API key qualifies, but
+    the project id does not.
     """
 
     def __init__(
@@ -183,23 +197,29 @@ class StagehandAgent(BaseAgent):
                 f"stdout: {mkdir_result.stdout or ''!r}"
             )
 
-        session_scope = getattr(environment, "session_scope", None)
-        has_session_scope = callable(session_scope)
-        browserbase_session_id = None
-        browserbase_connect_url = None
-        if not callable(session_scope):
-            browserbase_session_id = self._first_environment_value(
-                environment, ("browserbase_session_id",)
-            )
-            browserbase_connect_url = self._first_environment_value(
-                environment, ("browserbase_connect_url",)
-            )
-        has_browserbase_connection = bool(
-            has_session_scope
-            or browserbase_session_id
+        # Browserbase intent is explicit. Attribute presence is not a contract and
+        # canonical Docker environments must remain local (FINDING J).
+        uses_browserbase = bool(getattr(environment, "uses_browserbase", False))
+        browserbase_session_id = self._first_environment_value(
+            environment, ("browserbase_session_id",)
+        )
+        browserbase_connect_url = self._first_environment_value(
+            environment, ("browserbase_connect_url",)
+        )
+        precreated_session_requested = bool(
+            getattr(environment, "create_session", False)
             or browserbase_connect_url
         )
-        if not has_browserbase_connection:
+        if (
+            uses_browserbase
+            and precreated_session_requested
+            and not browserbase_session_id
+        ):
+            raise StagehandAgentFailedError(
+                "The environment advertises a pre-created Browserbase session but "
+                "has no browserbase_session_id"
+            )
+        if not uses_browserbase:
             self.logger.warning(
                 "No Browserbase session id or connect URL was found on the environment; "
                 "continuing as a local-environment eval"
@@ -209,19 +229,28 @@ class StagehandAgent(BaseAgent):
             trajectory_root=trajectory_root,
             trajectory_group=requested_group,
         )
-        if browserbase_session_id:
-            scoped_env["BROWSERBASE_SESSION_ID"] = browserbase_session_id
-        if browserbase_connect_url:
-            scoped_env["BROWSERBASE_CONNECT_URL"] = browserbase_connect_url
         command = self._build_eval_command(
-            resolved_task_id, use_browserbase=has_browserbase_connection
+            resolved_task_id, use_browserbase=uses_browserbase
         )
         self.logger.info(
             "Running Stagehand eval task %s in %s mode", resolved_task_id, self.mode
         )
         with ExitStack() as stack:
-            if callable(session_scope):
-                stack.enter_context(session_scope())
+            if uses_browserbase and browserbase_session_id:
+                session_scope = getattr(environment, "session_scope", None)
+                if callable(session_scope):
+                    try:
+                        stack.enter_context(session_scope())
+                    except RuntimeError as exc:
+                        raise StagehandAgentFailedError(
+                            "Could not enter the pre-created Browserbase session scope"
+                        ) from exc
+                else:
+                    # Compatibility path for explicit Browserbase environments that
+                    # expose session fields but not the ContextVar-backed helper.
+                    scoped_env["BROWSERBASE_SESSION_ID"] = browserbase_session_id
+                    if browserbase_connect_url:
+                        scoped_env["BROWSERBASE_CONNECT_URL"] = browserbase_connect_url
             stack.enter_context(environment.scoped_exec_env(scoped_env))
             result = await environment.exec(command, timeout_sec=self.timeout_sec)
 
@@ -332,7 +361,7 @@ class StagehandAgent(BaseAgent):
             "EVAL_TRAJECTORY_GROUP": trajectory_group,
             "VERIFIER_PERSIST_TRAJECTORIES": "1",
         }
-        for name in ("BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"):
+        for name in _FORWARDED_EXTRA_ENV_NAMES:
             value = self.extra_env.get(name)
             if value:
                 scoped_env[name] = value

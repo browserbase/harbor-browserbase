@@ -69,6 +69,7 @@ class RecordingBaseEnvironment(BaseEnvironment):
                 "command": command,
                 "cwd": cwd,
                 "env": merged_env,
+                "raw_env": env,
                 "timeout_sec": timeout_sec,
                 "user": user,
             }
@@ -103,6 +104,7 @@ class RecordingBrowserbaseEnvironment(BrowserbaseEnvironment):
                 "command": command,
                 "cwd": cwd,
                 "env": merged_env,
+                "raw_env": env,
                 "timeout_sec": timeout_sec,
                 "user": user,
             }
@@ -122,12 +124,20 @@ class FakeSessions:
         self.create_calls: list[dict[str, Any]] = []
         self.retrieve_calls: list[str] = []
         self.update_calls: list[tuple[str, str]] = []
+        self.create_started = None
+        self.create_gate = None
+        self.create_completed = False
         self.update_started = None
         self.update_gate = None
         self.update_completed = False
 
     async def create(self, **kwargs):
         self.create_calls.append(kwargs)
+        if self.create_started is not None:
+            self.create_started.set()
+        if self.create_gate is not None:
+            await self.create_gate.wait()
+        self.create_completed = True
         return SimpleNamespace(id=self.session_id, connect_url=self.connect_url)
 
     async def retrieve(self, session_id: str):
@@ -151,7 +161,11 @@ class FakeAsyncBrowserbase:
     def __init__(self, *, api_key: str):
         self.api_key = api_key
         self.sessions = self.sessions_factory()
+        self.close_calls = 0
         self.instances.append(self)
+
+    async def close(self):
+        self.close_calls = getattr(self, "close_calls", 0) + 1
 
 
 @pytest.fixture
@@ -160,6 +174,8 @@ def browserbase_env_factory(tmp_path):
         *,
         session_id: str = "trial__env",
         script=None,
+        create_session: bool = False,
+        delete_on_start_failure: bool = True,
     ) -> RecordingBrowserbaseEnvironment:
         environment_dir = tmp_path / f"environment-{session_id}"
         environment_dir.mkdir()
@@ -172,6 +188,8 @@ def browserbase_env_factory(tmp_path):
             trial_paths=trial_paths,
             task_env_config=EnvironmentConfig(),
             script=script,
+            create_session=create_session,
+            delete_on_start_failure=delete_on_start_failure,
         )
 
     return factory
@@ -205,6 +223,7 @@ def verifier_factory(tmp_path):
             "environment": environment,
             "logger": logging.getLogger("tests.stagehand-verifier"),
             "trajectory_dir": "/trajectory/run",
+            "prefer_persisted_result": False,
         }
         defaults.update(kwargs)
         return StagehandVerifier(**defaults)

@@ -1,11 +1,13 @@
 """Translate the existing TypeScript Stagehand verifier result for Harbor.
 
-This class invokes the Stagehand TypeScript verifier and translates its output; it
-never scores a trajectory.  Every successful call returns exactly ``reward``,
-``outcome``, ``process``, and ``criteria_earned_frac`` so Harbor reward constraints
-never observe a missing key.  ``CriteriaFraction`` exposes aggregation metadata,
-allowing callers to distinguish a zero denominator from criteria that all earned
-zero; the same distinction is logged at INFO.
+This class translates a Stagehand TypeScript verifier result; it never scores a
+trajectory.  It prefers the authoritative result persisted during the eval and
+falls back to invoking Stagehand's verifier.  Every successful call returns exactly
+``reward``, ``outcome``, ``process``, ``process_measured``, and
+``criteria_earned_frac`` so Harbor reward constraints never observe a missing key.
+``CriteriaFraction`` exposes aggregation metadata, allowing callers to distinguish
+a zero denominator from criteria that all earned zero; the same distinction is
+logged at INFO.
 
 Known synthesized judge-failure results are raised as unhealthy instead of being
 misreported as genuine zero rewards, which would poison an RL signal.  Process-mode
@@ -25,6 +27,7 @@ import shlex
 from typing import Any, Mapping, TypeGuard
 
 from harbor.models.verifier.result import VerifierResult
+from harbor.utils.env import resolve_env_vars
 from harbor.verifier.base import BaseVerifier
 
 from bb_harbor import TRAJECTORIES_ROOT, TRAJECTORY_POINTER_PATH
@@ -67,6 +70,10 @@ class StagehandVerifierError(RuntimeError):
 
 class StagehandVerifierExecError(StagehandVerifierError):
     """Raised when the container-side Stagehand CLI exits unsuccessfully."""
+
+
+class StagehandVerifierEnvError(StagehandVerifierError):
+    """Raised when a configured verifier environment template cannot resolve."""
 
 
 class StagehandVerifierOutputError(StagehandVerifierError):
@@ -149,7 +156,7 @@ def compute_criteria_fraction(per_criterion: object) -> CriteriaFraction:
 
 
 class StagehandVerifier(BaseVerifier):
-    """Run Stagehand verification in the Harbor environment and translate JSON."""
+    """Translate persisted Stagehand JSON, with a fresh verifier fallback."""
 
     def __init__(
         self,
@@ -162,6 +169,7 @@ class StagehandVerifier(BaseVerifier):
         cwd: str | None = None,
         timeout_sec: int | str | None = DEFAULT_TIMEOUT_SEC,
         user: str | int | None = None,
+        prefer_persisted_result: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -182,9 +190,27 @@ class StagehandVerifier(BaseVerifier):
         self.cwd = cwd
         self.timeout_sec = _coerce_timeout(timeout_sec)
         self.user = user
+        self.prefer_persisted_result: bool = prefer_persisted_result
+        self.reward_source: str | None = None
+        self._resolved_exec_env: dict[str, str] | None = None
+        self._exec_env_resolved: bool = False
 
     async def verify(self) -> VerifierResult:
+        self.reward_source = None
         trajectory_dir = await self._resolve_trajectory_dir()
+        logger = self.logger or _LOGGER
+        result: dict[str, object] | None = None
+        if self.prefer_persisted_result:
+            result = await self._read_persisted_result(trajectory_dir)
+        if result is not None:
+            self.reward_source = "reward source: persisted scores/result.json"
+        else:
+            result = await self._run_fresh_verifier(trajectory_dir)
+            self.reward_source = "reward source: evals verify --json"
+        logger.info("%s", self.reward_source)
+        return self._translate_result(result, trajectory_dir)
+
+    async def _run_fresh_verifier(self, trajectory_dir: str) -> dict[str, object]:
         command = (
             f"{shlex.quote(self.evals_bin)} verify {shlex.quote(trajectory_dir)} "
             f"--json --model {shlex.quote(self.judge_model)}"
@@ -195,6 +221,7 @@ class StagehandVerifier(BaseVerifier):
         exec_result = await self.environment.exec(
             command,
             cwd=self.cwd,
+            env=self._verifier_exec_env(),
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
@@ -203,7 +230,37 @@ class StagehandVerifier(BaseVerifier):
                 _exec_failure_message("Stagehand verifier command", exec_result)
             )
 
-        result = _parse_result(exec_result.stdout, exec_result.stderr)
+        return _parse_result(exec_result.stdout, exec_result.stderr)
+
+    async def _read_persisted_result(
+        self, trajectory_dir: str
+    ) -> dict[str, object] | None:
+        # trajectoryRecorder.ts ~283 writes the in-run EvaluationResult here.
+        result_path = posixpath.join(trajectory_dir, "scores", "result.json")
+        exec_result = await self.environment.exec(
+            f"cat {shlex.quote(result_path)}",
+            cwd=self.cwd,
+            env=self._verifier_exec_env(),
+            timeout_sec=self.timeout_sec,
+            user=self.user,
+        )
+        if exec_result.return_code != 0:
+            return None
+        try:
+            parsed = json.loads(exec_result.stdout or "")
+        except (json.JSONDecodeError, TypeError):
+            return None
+        # EvaluationResult.outcomeSuccess is required in verifier/types.ts ~344.
+        if not isinstance(parsed, dict) or not isinstance(
+            parsed.get("outcomeSuccess"), bool
+        ):
+            return None
+        return parsed
+
+    def _translate_result(
+        self, result: dict[str, object], trajectory_dir: str
+    ) -> VerifierResult:
+        logger = self.logger or _LOGGER
         matched_signature = _judge_failure_signature(result)
         if matched_signature is not None:
             raise StagehandVerifierUnhealthyError(
@@ -220,8 +277,15 @@ class StagehandVerifier(BaseVerifier):
             )
         outcome_reward = 1.0 if outcome_success else 0.0
 
+        # EvaluationResult.processScore is optional in verifier/types.ts ~351.
         process_score = result.get("processScore")
-        process_reward = float(process_score) if _is_number(process_score) else 0.0
+        process_measured = _is_number(process_score)
+        process_reward = float(process_score) if process_measured else 0.0
+        if not process_measured:
+            logger.info(
+                "Stagehand process score was not measured; emitting process=0.0 "
+                "and process_measured=0.0"
+            )
 
         criteria = compute_criteria_fraction(result.get("perCriterion"))
         if criteria.total_max == 0.0:
@@ -244,9 +308,47 @@ class StagehandVerifier(BaseVerifier):
                 "reward": outcome_reward,
                 "outcome": outcome_reward,
                 "process": process_reward,
+                "process_measured": 1.0 if process_measured else 0.0,
                 "criteria_earned_frac": criteria.fraction,
             }
         )
+
+    def _verifier_exec_env(self) -> dict[str, str] | None:
+        if self._exec_env_resolved:
+            return self._resolved_exec_env
+
+        # Harbor verifier/verifier.py ~159 merges in this exact precedence.
+        task_config = getattr(self.task, "config", None)
+        task_verifier = getattr(task_config, "verifier", None)
+        task_env = getattr(task_verifier, "env", None)
+        merged_env = {
+            **(task_env if isinstance(task_env, Mapping) else {}),
+            **(self.verifier_env or {}),
+            **self.override_env,
+        }
+        if not merged_env:
+            self._resolved_exec_env = None
+            self._exec_env_resolved = True
+            return None
+
+        try:
+            resolved = resolve_env_vars(merged_env)
+        except ValueError as error:
+            offending_keys: list[str] = []
+            for key, value in merged_env.items():
+                try:
+                    resolve_env_vars({key: value})
+                except ValueError:
+                    offending_keys.append(key)
+            named_keys = ", ".join(sorted(offending_keys)) or "<unknown>"
+            raise StagehandVerifierEnvError(
+                "Could not resolve verifier environment templates for keys: "
+                f"{named_keys}"
+            ) from error
+
+        self._resolved_exec_env = resolved
+        self._exec_env_resolved = True
+        return self._resolved_exec_env
 
     def _resolve_setting(
         self,
@@ -276,6 +378,7 @@ class StagehandVerifier(BaseVerifier):
             pointer_result = await self.environment.exec(
                 f"cat {shlex.quote(self.trajectory_pointer_path)}",
                 cwd=self.cwd,
+                env=self._verifier_exec_env(),
                 timeout_sec=self.timeout_sec,
                 user=self.user,
             )
@@ -294,6 +397,7 @@ class StagehandVerifier(BaseVerifier):
         find_result = await self.environment.exec(
             find_command,
             cwd=self.cwd,
+            env=self._verifier_exec_env(),
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
@@ -327,6 +431,7 @@ class StagehandVerifier(BaseVerifier):
         stat_result = await self.environment.exec(
             stat_command,
             cwd=self.cwd,
+            env=self._verifier_exec_env(),
             timeout_sec=self.timeout_sec,
             user=self.user,
         )
@@ -507,6 +612,7 @@ __all__ = [
     "DEFAULT_JUDGE_MODEL",
     "DEFAULT_TRAJECTORIES_ROOT",
     "StagehandVerifier",
+    "StagehandVerifierEnvError",
     "StagehandVerifierError",
     "StagehandVerifierExecError",
     "StagehandVerifierOutputError",

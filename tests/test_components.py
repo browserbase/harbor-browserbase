@@ -20,6 +20,7 @@ from bb_harbor.env import BrowserbaseEnvironment
 from bb_harbor.verifier import (
     DEFAULT_JUDGE_MODEL,
     StagehandVerifier,
+    StagehandVerifierEnvError,
     StagehandVerifierUnhealthyError,
     _SYNTHESIZED_JUDGE_FAILURE_DESCRIPTIONS,
     _SYNTHESIZED_JUDGE_FAILURE_REASONINGS,
@@ -37,7 +38,13 @@ from harbor.models.task.verifier_mode import VerifierEnvironmentMode
 from conftest import FakeAsyncBrowserbase, FakeSessions, RecordingBaseEnvironment
 
 
-REWARD_KEYS = {"reward", "outcome", "process", "criteria_earned_frac"}
+REWARD_KEYS = {
+    "reward",
+    "outcome",
+    "process",
+    "process_measured",
+    "criteria_earned_frac",
+}
 INSTRUCTION = "stagehand-task-id: agent/columbia_tuition"
 
 
@@ -89,8 +96,12 @@ async def test_browserbase_scopes_are_isolated_across_interleaved_tasks(
             return ExecResult(stdout=f"1\t10\t{path}\n", return_code=0)
         return ExecResult(return_code=0)
 
-    env_a = browserbase_env_factory(session_id="trial-a__env", script=script)
-    env_b = browserbase_env_factory(session_id="trial-b__env", script=script)
+    env_a = browserbase_env_factory(
+        session_id="trial-a__env", script=script, create_session=True
+    )
+    env_b = browserbase_env_factory(
+        session_id="trial-b__env", script=script, create_session=True
+    )
     env_a.browserbase_session_id = "bb-a"
     env_a.browserbase_connect_url = "wss://a"
     env_b.browserbase_session_id = "bb-b"
@@ -167,7 +178,7 @@ async def test_session_scope_overlay_does_not_leak_into_a_concurrent_unscoped_ta
 ):
     """Required assertion 2 (discriminating): session_scope stays task-local."""
 
-    environment = browserbase_env_factory()
+    environment = browserbase_env_factory(create_session=True)
     environment.browserbase_session_id = "scoped-session"
     environment.browserbase_connect_url = "wss://scoped"
     scope_entered = asyncio.Event()
@@ -200,7 +211,7 @@ async def test_session_scope_overlay_does_not_leak_into_a_concurrent_unscoped_ta
 async def test_session_scope_overlay_is_released_on_exit(browserbase_env_factory):
     """Required assertion 2: session_scope resets its overlay token on exit."""
 
-    environment = browserbase_env_factory()
+    environment = browserbase_env_factory(create_session=True)
     environment.browserbase_session_id = "scoped-session"
     environment.browserbase_connect_url = "wss://scoped"
 
@@ -223,11 +234,13 @@ async def test_start_preserves_harbor_session_id(
     """Required assertion 3: Browserbase startup does not clobber Harbor identity."""
 
     fake_sessions = FakeSessions("sdk-session", "wss://sdk")
+    clients = []
 
     class Client(FakeAsyncBrowserbase):
         def __init__(self, *, api_key):
             self.api_key = api_key
             self.sessions = fake_sessions
+            clients.append(self)
 
     async def docker_start(self, force_build):
         return None
@@ -240,15 +253,71 @@ async def test_start_preserves_harbor_session_id(
     monkeypatch.setattr(env_module, "AsyncBrowserbase", Client)
     monkeypatch.setattr(DockerEnvironment, "start", docker_start)
     monkeypatch.setattr(DockerEnvironment, "stop", docker_stop)
-    env = browserbase_env_factory(session_id="trial-x__env")
+    env = browserbase_env_factory(
+        session_id="trial-x__env", create_session=True
+    )
 
     await env.start(force_build=False)
     assert env.session_id == "trial-x__env"
     assert env.browserbase_session_id == "sdk-session"
     assert fake_sessions.create_calls == [
-        {"project_id": "project", "keep_alive": True}
+        {
+            "project_id": "project",
+            "keep_alive": True,
+            "user_metadata": {"harborSessionId": "trial-x__env"},
+        }
     ]
     await env.stop(delete=True)
+    assert clients[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_default_start_leaves_session_creation_to_stagehand(
+    monkeypatch, browserbase_env_factory, agent_factory
+):
+    """Default startup consumes one Stagehand-owned Browserbase session."""
+
+    sessions = FakeSessions()
+
+    class Client(FakeAsyncBrowserbase):
+        def __init__(self, *, api_key):
+            self.api_key = api_key
+            self.sessions = sessions
+
+    async def docker_start(self, force_build):
+        return None
+
+    async def docker_stop(self, delete):
+        return None
+
+    trajectory_dir = f"{TRAJECTORIES_ROOT}/default/group/agent/columbia_tuition/run"
+
+    def script(command, merged_env):
+        if command.startswith("find "):
+            return ExecResult(
+                stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
+            )
+        return ExecResult(return_code=0)
+
+    monkeypatch.setenv("BROWSERBASE_API_KEY", "key")
+    monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "project")
+    monkeypatch.setattr(env_module, "AsyncBrowserbase", Client)
+    monkeypatch.setattr(DockerEnvironment, "start", docker_start)
+    monkeypatch.setattr(DockerEnvironment, "stop", docker_stop)
+    environment = browserbase_env_factory(script=script)
+
+    await environment.start(force_build=False)
+    await agent_factory().run(INSTRUCTION, environment, AgentContext())
+
+    eval_call = next(
+        call for call in environment.calls if call["command"].startswith("evals run")
+    )
+    assert sessions.create_calls == []
+    assert environment.browserbase_session_id is None
+    assert "BROWSERBASE_SESSION_ID" not in eval_call["env"]
+    assert "BROWSERBASE_CONNECT_URL" not in eval_call["env"]
+    assert "--env browserbase" in eval_call["command"]
+    await environment.stop(delete=True)
 
 
 @pytest.mark.asyncio
@@ -265,9 +334,17 @@ async def test_stop_shields_release_from_task_cancellation(
         return None
 
     monkeypatch.setattr(DockerEnvironment, "stop", docker_stop)
-    env = browserbase_env_factory()
+    env = browserbase_env_factory(create_session=True)
     env.browserbase_session_id = "sdk-session"
-    env._browserbase_client = type("Client", (), {"sessions": sessions})()
+
+    class Client:
+        def __init__(self):
+            self.sessions = sessions
+
+        async def close(self):
+            return None
+
+    env._browserbase_client = Client()
 
     stop_task = asyncio.create_task(env.stop(delete=True))
     await asyncio.wait_for(sessions.update_started.wait(), timeout=1)
@@ -283,16 +360,86 @@ async def test_stop_shields_release_from_task_cancellation(
     assert sessions.update_calls == [("sdk-session", "REQUEST_RELEASE")]
 
 
-def test_session_env_requires_start_and_omits_missing_connect_url(
+@pytest.mark.asyncio
+async def test_cancelled_create_records_session_for_later_release(
+    monkeypatch, browserbase_env_factory
+):
+    """A cancellation cannot orphan an in-flight keep-alive session response."""
+
+    sessions = FakeSessions("sdk-session", "wss://sdk")
+    sessions.create_started = asyncio.Event()
+    sessions.create_gate = asyncio.Event()
+
+    class Client(FakeAsyncBrowserbase):
+        def __init__(self, *, api_key):
+            self.api_key = api_key
+            self.sessions = sessions
+
+    async def docker_start(self, force_build):
+        return None
+
+    async def docker_stop(self, delete):
+        return None
+
+    monkeypatch.setenv("BROWSERBASE_API_KEY", "key")
+    monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "project")
+    monkeypatch.setattr(env_module, "AsyncBrowserbase", Client)
+    monkeypatch.setattr(DockerEnvironment, "start", docker_start)
+    monkeypatch.setattr(DockerEnvironment, "stop", docker_stop)
+    environment = browserbase_env_factory(create_session=True)
+
+    start_task = asyncio.create_task(environment.start(force_build=False))
+    await asyncio.wait_for(sessions.create_started.wait(), timeout=1)
+    start_task.cancel()
+    sessions.create_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+
+    assert sessions.create_completed is True
+    assert environment.browserbase_session_id == "sdk-session"
+    await environment.stop(delete=True)
+    assert sessions.update_calls == [("sdk-session", "REQUEST_RELEASE")]
+
+
+def test_session_env_is_empty_before_start_and_omits_missing_connect_url(
     browserbase_env_factory,
 ):
-    """Environment contract: session export is guarded and omits falsy values."""
+    """Environment contract: an absent opt-in session is a valid no-op."""
 
     environment = browserbase_env_factory()
-    with pytest.raises(RuntimeError, match="call start"):
-        environment.session_env()
+    assert environment.session_env() == {}
+    with environment.session_scope():
+        assert environment.session_env() == {}
     environment.browserbase_session_id = "bb-session"
     assert environment.session_env() == {"BROWSERBASE_SESSION_ID": "bb-session"}
+
+
+@pytest.mark.asyncio
+async def test_session_health_check_tolerates_unknown_then_stops_on_terminal_status(
+    caplog, browserbase_env_factory
+):
+    """The background observer accepts old response shapes and logs terminal state."""
+
+    class Sessions:
+        def __init__(self):
+            self.retrieve_calls = []
+
+        async def retrieve(self, session_id):
+            self.retrieve_calls.append(session_id)
+            if len(self.retrieve_calls) == 1:
+                return type("Response", (), {})()
+            return type("Response", (), {"status": "COMPLETED"})()
+
+    sessions = Sessions()
+    environment = browserbase_env_factory()
+    environment._browserbase_client = type("Client", (), {"sessions": sessions})()
+
+    await asyncio.wait_for(
+        environment._session_health_check("sdk-session", interval=0), timeout=1
+    )
+
+    assert sessions.retrieve_calls == ["sdk-session", "sdk-session"]
+    assert "observed status COMPLETED" in caplog.text
 
 
 def test_preflight_reports_all_missing_browserbase_variables(monkeypatch):
@@ -311,7 +458,7 @@ def test_preflight_reports_all_missing_browserbase_variables(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_browserbase_startup_failure_tears_down_docker(
-    monkeypatch, browserbase_env_factory
+    monkeypatch, browserbase_env_factory, caplog
 ):
     """Environment contract: failed remote startup rolls Docker back."""
 
@@ -325,6 +472,9 @@ async def test_browserbase_startup_failure_tears_down_docker(
         def __init__(self, *, api_key):
             self.sessions = FailingSessions()
 
+        async def close(self):
+            return None
+
     async def docker_start(self, force_build):
         return None
 
@@ -336,18 +486,22 @@ async def test_browserbase_startup_failure_tears_down_docker(
     monkeypatch.setattr(env_module, "AsyncBrowserbase", Client)
     monkeypatch.setattr(DockerEnvironment, "start", docker_start)
     monkeypatch.setattr(DockerEnvironment, "stop", docker_stop)
-    environment = browserbase_env_factory()
+    environment = browserbase_env_factory(
+        create_session=True, delete_on_start_failure=False
+    )
 
     with pytest.raises(RuntimeError, match="create failed"):
         await environment.start(force_build=False)
-    assert teardown_calls == [True]
+    assert teardown_calls == [False]
+    assert environment._browserbase_client is None
+    assert "possible Browserbase session leak" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_agent_falls_back_to_browserbase_attributes_without_session_scope(
+async def test_agent_uses_explicit_browserbase_flag_without_session_scope(
     tmp_path, agent_factory
 ):
-    """Drift 2 regression: plain environments receive the compatibility overlay."""
+    """An explicit Browserbase environment receives the compatibility overlay."""
 
     trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
 
@@ -359,6 +513,7 @@ async def test_agent_falls_back_to_browserbase_attributes_without_session_scope(
         return ExecResult(return_code=0)
 
     environment = RecordingBaseEnvironment(tmp_path, script)
+    environment.uses_browserbase = True
     environment.browserbase_session_id = "fallback-session"
     environment.browserbase_connect_url = "wss://fallback"
     await agent_factory().run(INSTRUCTION, environment, AgentContext())
@@ -369,6 +524,82 @@ async def test_agent_falls_back_to_browserbase_attributes_without_session_scope(
     assert eval_call["env"]["BROWSERBASE_SESSION_ID"] == "fallback-session"
     assert eval_call["env"]["BROWSERBASE_CONNECT_URL"] == "wss://fallback"
     assert "--env browserbase" in eval_call["command"]
+
+
+@pytest.mark.asyncio
+async def test_agent_classifies_missing_precreated_session_id(
+    browserbase_env_factory, agent_factory
+):
+    """A broken opt-in session contract raises the Harbor-classifiable error."""
+
+    environment = browserbase_env_factory(create_session=True)
+    with pytest.raises(StagehandAgentFailedError, match="no browserbase_session_id"):
+        await agent_factory().run(INSTRUCTION, environment, AgentContext())
+
+
+@pytest.mark.asyncio
+async def test_callable_session_scope_does_not_imply_browserbase(
+    tmp_path, agent_factory
+):
+    """A plain environment stays local even if it happens to expose a scope helper."""
+
+    trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
+
+    def script(command, merged_env):
+        if command.startswith("find "):
+            return ExecResult(
+                stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
+            )
+        return ExecResult(return_code=0)
+
+    environment = RecordingBaseEnvironment(tmp_path, script)
+    environment.session_scope = lambda: environment.scoped_exec_env(
+        {"SHOULD_NOT_BE_INJECTED": "1"}
+    )
+    await agent_factory().run(INSTRUCTION, environment, AgentContext())
+
+    eval_call = next(
+        call for call in environment.calls if call["command"].startswith("evals run")
+    )
+    assert "--env browserbase" not in eval_call["command"]
+    assert "SHOULD_NOT_BE_INJECTED" not in eval_call["env"]
+
+
+@pytest.mark.asyncio
+async def test_agent_forwards_present_provider_keys_without_inventing_absent_ones(
+    tmp_path, agent_factory
+):
+    """Provider credentials come only from extra_env and omit absent aliases."""
+
+    trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
+
+    def script(command, env):
+        if command.startswith("find "):
+            return ExecResult(
+                stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
+            )
+        return ExecResult(return_code=0)
+
+    with_key = RecordingBaseEnvironment(tmp_path, script, session_id="with-key")
+    await agent_factory(extra_env={"GEMINI_API_KEY": "provider-key"}).run(
+        INSTRUCTION, with_key, AgentContext()
+    )
+    eval_with_key = next(
+        call for call in with_key.calls if call["command"].startswith("evals run")
+    )
+    assert eval_with_key["env"]["GEMINI_API_KEY"] == "provider-key"
+
+    without_key = RecordingBaseEnvironment(tmp_path, script, session_id="without-key")
+    await agent_factory(extra_env={}).run(INSTRUCTION, without_key, AgentContext())
+    eval_without_key = next(
+        call for call in without_key.calls if call["command"].startswith("evals run")
+    )
+    for name in (
+        "GEMINI_API_KEY",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+        "GOOGLE_API_KEY",
+    ):
+        assert name not in eval_without_key["env"]
 
 
 @pytest.mark.asyncio
@@ -385,10 +616,119 @@ async def test_success_returns_all_reward_keys_and_builds_json_model_command(
 
     assert set(result.rewards or {}) == REWARD_KEYS
     assert "reward" in (result.rewards or {})
+    assert result.rewards["process_measured"] == 1.0
     command = environment.calls[0]["command"]
     assert "--json" in command
     assert "--model" in command
     assert DEFAULT_JUDGE_MODEL != "gemini-2.5-flash"
+
+
+@pytest.mark.asyncio
+async def test_verifier_exec_env_uses_override_precedence_and_none_when_empty(
+    tmp_path, verifier_factory
+):
+    """Verifier exec receives Harbor's resolved env, including explicit None."""
+
+    payload = {"outcomeSuccess": True}
+
+    def script(command, env):
+        return ExecResult(stdout=json.dumps(payload), return_code=0)
+
+    configured_environment = RecordingBaseEnvironment(tmp_path, script)
+    await verifier_factory(
+        configured_environment,
+        verifier_env={"GEMINI_API_KEY": "vk"},
+        override_env={"GEMINI_API_KEY": "ok"},
+    ).verify()
+    assert configured_environment.calls[0]["raw_env"]["GEMINI_API_KEY"] == "ok"
+
+    empty_environment = RecordingBaseEnvironment(tmp_path, script)
+    await verifier_factory(empty_environment).verify()
+    assert empty_environment.calls[0]["raw_env"] is None
+
+
+@pytest.mark.asyncio
+async def test_verifier_unresolved_env_names_offending_keys(
+    monkeypatch, tmp_path, verifier_factory
+):
+    """Unresolved templates raise the integration error with destination keys."""
+
+    monkeypatch.delenv("MISSING_STAGEHAND_TEST_KEY", raising=False)
+    environment = RecordingBaseEnvironment(tmp_path)
+    verifier = verifier_factory(
+        environment,
+        verifier_env={"GEMINI_API_KEY": "${MISSING_STAGEHAND_TEST_KEY}"},
+    )
+    with pytest.raises(StagehandVerifierEnvError, match="GEMINI_API_KEY"):
+        await verifier.verify()
+
+
+@pytest.mark.asyncio
+async def test_verifier_prefers_persisted_result_without_fresh_judge(
+    tmp_path, verifier_factory
+):
+    payload = {"outcomeSuccess": True, "processScore": 0.75}
+
+    def script(command, env):
+        if command == "cat /trajectory/run/scores/result.json":
+            return ExecResult(stdout=json.dumps(payload), return_code=0)
+        raise AssertionError(f"fresh verifier should not run: {command}")
+
+    environment = RecordingBaseEnvironment(tmp_path, script)
+    verifier = verifier_factory(environment, prefer_persisted_result=True)
+    result = await verifier.verify()
+
+    assert result.rewards["process"] == 0.75
+    assert verifier.reward_source == "reward source: persisted scores/result.json"
+    assert not any(
+        call["command"].startswith("evals verify") for call in environment.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_verifier_falls_back_when_persisted_result_is_missing(
+    tmp_path, verifier_factory
+):
+    payload = {"outcomeSuccess": False}
+
+    def script(command, env):
+        if command.startswith("cat "):
+            return ExecResult(stderr="missing", return_code=1)
+        if command.startswith("evals verify"):
+            return ExecResult(stdout=json.dumps(payload), return_code=0)
+        raise AssertionError(command)
+
+    environment = RecordingBaseEnvironment(tmp_path, script)
+    verifier = verifier_factory(environment, prefer_persisted_result=True)
+    result = await verifier.verify()
+
+    assert result.rewards["reward"] == 0.0
+    assert verifier.reward_source == "reward source: evals verify --json"
+    assert [call["command"].split()[0] for call in environment.calls] == [
+        "cat",
+        "evals",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_persisted_dead_judge_result_is_still_unhealthy(
+    tmp_path, verifier_factory
+):
+    payload = {
+        "outcomeSuccess": False,
+        "explanation": next(iter(_SYNTHESIZED_JUDGE_FAILURE_REASONINGS)),
+    }
+    environment = RecordingBaseEnvironment(
+        tmp_path,
+        lambda command, env: ExecResult(
+            stdout=json.dumps(payload), return_code=0
+        ),
+    )
+    verifier = verifier_factory(environment, prefer_persisted_result=True)
+
+    with pytest.raises(StagehandVerifierUnhealthyError):
+        await verifier.verify()
+    assert verifier.reward_source == "reward source: persisted scores/result.json"
 
 
 def test_criteria_fraction_excludes_null_earned_points():
@@ -499,6 +839,8 @@ async def test_legitimate_all_criteria_failure_returns_zero_with_all_keys(
     )
     result = await verifier_factory(environment).verify()
     assert result.rewards["reward"] == 0.0
+    assert result.rewards["process"] == 0.0
+    assert result.rewards["process_measured"] == 0.0
     assert set(result.rewards) == REWARD_KEYS
 
 
@@ -514,7 +856,7 @@ async def test_agent_rejects_missing_or_empty_trajectory(
             return ExecResult(stdout=find_stdout, return_code=0)
         return ExecResult(return_code=0)
 
-    environment = browserbase_env_factory(script=script)
+    environment = browserbase_env_factory(script=script, create_session=True)
     environment.browserbase_session_id = "bb-session"
     environment.browserbase_connect_url = "wss://session"
     with pytest.raises(StagehandAgentFailedError):
@@ -538,7 +880,7 @@ async def test_agent_publishes_trajectory_metadata_and_pointer(
             )
         return ExecResult(return_code=0)
 
-    environment = browserbase_env_factory(script=script)
+    environment = browserbase_env_factory(script=script, create_session=True)
     environment.browserbase_session_id = "bb-session"
     environment.browserbase_connect_url = "wss://session"
     agent = agent_factory()
@@ -574,6 +916,7 @@ def test_job_config_validates_and_import_paths_resolve(monkeypatch):
     payload = yaml.safe_load((repo_root / "job.yaml").read_text())
     monkeypatch.setenv("BROWSERBASE_API_KEY", "test-key")
     monkeypatch.setenv("BROWSERBASE_PROJECT_ID", "test-project")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     config = JobConfig.model_validate(payload)
 
     import_paths = [
@@ -587,9 +930,15 @@ def test_job_config_validates_and_import_paths_resolve(monkeypatch):
         assert getattr(importlib.import_module(module_name), class_name) is expected_class
 
     assert config.environment.type is None
+    assert config.environment.kwargs == {
+        "create_session": False,
+        "delete_on_start_failure": True,
+    }
     assert config.n_concurrent_trials == 2
     assert config.tasks[0].path == Path("tasks/wtb-smoke")
     assert config.agents[0].env["BROWSERBASE_API_KEY"] == "${BROWSERBASE_API_KEY}"
+    assert config.agents[0].env["GEMINI_API_KEY"] == "${GEMINI_API_KEY}"
+    assert config.verifier.env["GEMINI_API_KEY"] == "${GEMINI_API_KEY}"
     assert config.verifier.kwargs["judge_model"] == "google/gemini-3-flash-preview"
 
 

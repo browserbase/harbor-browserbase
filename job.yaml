@@ -1,8 +1,9 @@
 # Custom environment, agent, and verifier implementations belong in this job-level
 # config because task.toml cannot wire their import paths.
-# Harbor's scrubber does not match BROWSERBASE_PROJECT_ID or the signed connect URL
-# (its key regex is KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|AUTH), so strip the
-# trajectory directory separately before sharing trial output.
+# Harbor scrubs the BROWSERBASE_API_KEY value from agent output, including when
+# that literal is embedded in a signed connect URL. BROWSERBASE_PROJECT_ID does
+# not match its sensitive-key regex and survives in jobs output; stripping that
+# identifier before sharing is an operator responsibility and a known gap.
 job_name: browserbase-wtb-smoke
 jobs_dir: jobs
 n_concurrent_trials: 2
@@ -12,6 +13,11 @@ tasks:
 
 environment:
   import_path: bb_harbor.env:BrowserbaseEnvironment
+  kwargs:
+    # Canonical Stagehand must own the session; true would create an inert second
+    # session unless Stagehand is patched to forward browserbaseSessionID to initV3.
+    create_session: false
+    delete_on_start_failure: true
 
 agents:
   - import_path: bb_harbor.agent:StagehandAgent
@@ -21,8 +27,11 @@ agents:
     env:
       BROWSERBASE_API_KEY: ${BROWSERBASE_API_KEY}
       BROWSERBASE_PROJECT_ID: ${BROWSERBASE_PROJECT_ID}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
 
 verifier:
   import_path: bb_harbor.verifier:StagehandVerifier
+  env:
+    GEMINI_API_KEY: ${GEMINI_API_KEY}
   kwargs:
     judge_model: google/gemini-3-flash-preview

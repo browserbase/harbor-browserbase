@@ -131,6 +131,14 @@ The public, non-underscore attributes assigned directly on `self` by `BaseEnviro
 
 Harbor orchestration owns the environment `session_id`: `BaseEnvironment` accepts and stores it, while `Trial` supplies `{trial_name}__env` for the agent environment (`harbor/environments/base.py:116-138`, `harbor/environments/base.py:178-181`, `harbor/trial/trial.py:825-836`). A separate verifier environment uses `{trial_name}__verifier__{key}`, replaces characters outside alphanumeric/`-._` with `_`, and truncates beyond 63 characters with an eight-hex SHA-1 suffix (`harbor/trial/trial.py:674-683`). Trial names default to `{task_name_up_to_32_chars}__{7-character_shortuuid}` (`harbor/models/trial/config.py:453-462`).
 
+The run/trial-level `EnvironmentConfig` in `harbor/models/trial/config.py:196` has both `delete: bool = True` and `kwargs: dict[str, Any]`. `EnvironmentFactory.create_environment_from_config` expands `config.kwargs` into the custom environment constructor (`harbor/environments/factory.py:302-342`). The separately defined task-level `EnvironmentConfig` stored as `self.task_env_config` is from `harbor/models/task/config.py:416`; it describes the task image/resources and has no `delete` field. Consequently, startup-failure deletion policy cannot be recovered from `self.task_env_config` and must be passed through run-level `environment.kwargs`.
+
+## Browserbase session ownership
+
+Canonical Stagehand owns the Browserbase session by default. Its eval packages contain no reads of `BROWSERBASE_SESSION_ID` or `BROWSERBASE_CONNECT_URL`. Session reuse is exposed as the `browserbaseSessionID` V3 option (`stagehand/packages/core/lib/v3/types/public/options.ts:36`) and is copied only from `configOverrides` by `stagehand/packages/evals/initV3.ts:118`; both bench callers pass only `{ env: config.environment }` (`stagehand/packages/evals/framework/benchHarness.ts:167-181`, `189-203`), and `evals run` declares no session-id flag (`stagehand/packages/evals/tui/commands/parse.ts`).
+
+`BrowserbaseEnvironment(create_session=False)` therefore creates no SDK session, while its explicit `uses_browserbase = True` still makes the agent invoke `evals run ... --env browserbase`. `create_session=True` remains an opt-in for a patched Stagehand build that forwards `browserbaseSessionID` into `initV3`; with canonical Stagehand, the injected variables are inert and the option creates a second billed session. Session overlays still use `BaseEnvironment.scoped_exec_env`, including the empty no-op scope, so they remain `ContextVar`-local under concurrent trials.
+
 ## `BaseAgent`
 
 Runtime inspection reports these exact `BaseAgent.__abstractmethods__` names: `name`, `run`, `setup`, and `version`.
@@ -408,6 +416,8 @@ _SENSITIVE_KEY_RE = re.compile(
 ```
 
 The scrub pass is called during finalization (`harbor/trial/trial.py:365-372`) and replaces literal matches with `[REDACTED]` in non-symlink, UTF-8-looking, non-binary files under the trial directory (`harbor/trial/trial.py:756-778`). It does **not** collect values from task-level `[environment].env`, run-level `environment.env`, `solution.env`, arbitrary host environment variables that are not referenced by one of the three collected mappings, verifier/agent kwargs, or any key whose name does not match the pattern.
+
+In this integration, `BROWSERBASE_API_KEY` is in `agent.extra_env` and its name matches `KEY`, so Harbor replaces that literal even where it is embedded inside a signed Browserbase connect URL. `BROWSERBASE_PROJECT_ID` does not match the sensitive-key regex, so its value survives verbatim in the jobs directory. Removing the project id before jobs output is shared is currently an operator responsibility and a known gap; there is no integration-level trial scrub hook here.
 
 ## Gotchas
 
