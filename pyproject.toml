@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bb-harbor"
+version = "0.1.0"
+description = "Browserbase-backed Harbor integrations"
+requires-python = ">=3.12"
+dependencies = [
+    "harbor>=0.20.0",
+    "browserbase",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["bb_harbor"]
