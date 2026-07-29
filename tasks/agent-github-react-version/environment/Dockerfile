@@ -23,6 +23,19 @@ RUN apt-get update \
          git clone --depth 1 "$STAGEHAND_REPO" /opt/stagehand; \
        fi
 
+# TEMPORARY: pending the upstream PR from the Stagehand branch
+# fix/benchharness-config-overrides. Delete patches/ and these two steps once
+# it lands on public main. This file must stay byte-identical across all ten
+# tasks/*/environment/ directories or Harbor will build ten separate images
+# instead of sharing one.
+COPY patches/ /tmp/stagehand-patches/
+
+RUN cd /opt/stagehand \
+    && git apply --check /tmp/stagehand-patches/benchharness-config-overrides.patch \
+    && git apply /tmp/stagehand-patches/benchharness-config-overrides.patch \
+    && grep -q 'experimental: !' packages/evals/framework/benchHarness.ts \
+    && grep -q 'browserbaseSessionID: process.env.BROWSERBASE_SESSION_ID' packages/evals/framework/benchHarness.ts
+
 WORKDIR /opt/stagehand
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1

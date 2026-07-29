@@ -1,0 +1,64 @@
+From 57059870a6f98982ba03ad98a590a09d189b56c7 Mon Sep 17 00:00:00 2001
+From: miguel <miguel@browserbase.com>
+Date: Wed, 29 Jul 2026 16:00:35 -0700
+Subject: [PATCH] fix(evals): forward experimental + browserbaseSessionID via
+ benchHarness configOverrides
+
+Both initV3 call sites passed only { env }, dropping two fields initV3
+already supports:
+
+- experimental: verifierAdapter injects trajectory-recorder callbacks
+  unconditionally, so experimental=false made every agent eval throw
+  ExperimentalNotConfiguredError("Agent callbacks") before taking a
+  step (observed: status=error, 0 steps, 0 tokens).
+- browserbaseSessionID: an externally-created Browserbase session could
+  never be reused, so an orchestrator could not hand off a session.
+
+Both call sites now share one override object so they cannot drift again.
+BENCH_EXPERIMENTAL=0|false opts out; BROWSERBASE_SESSION_ID is forwarded
+when non-empty.
+---
+ packages/evals/framework/benchHarness.ts | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/packages/evals/framework/benchHarness.ts b/packages/evals/framework/benchHarness.ts
+index 247acf141..dfcb0a4fa 100644
+--- a/packages/evals/framework/benchHarness.ts
++++ b/packages/evals/framework/benchHarness.ts
+@@ -153,6 +153,15 @@ export const stagehandHarness: BenchHarness = {
+     const config = row.config;
+     const agentMode = config.agentMode ?? input.agentMode;
+     const isCUA = config.isCUA ?? input.isCUA;
++    // The bench verifier injects callbacks unconditionally, so experimental
++    // defaults on. Set BENCH_EXPERIMENTAL=0 or false to force it off.
++    const configOverrides = {
++      env: config.environment,
++      experimental: !/^(?:0|false)$/i.test(
++        process.env.BENCH_EXPERIMENTAL ?? "",
++      ),
++      browserbaseSessionID: process.env.BROWSERBASE_SESSION_ID || undefined,
++    };
+ 
+     if (config.useApi) {
+       const provider = resolveProvider(input.modelName);
+@@ -172,7 +181,7 @@ export const stagehandHarness: BenchHarness = {
+         agentMode,
+         isCUA,
+         verbose,
+-        configOverrides: { env: config.environment },
++        configOverrides,
+       });
+     } else {
+       let llmClient: LLMClient | undefined;
+@@ -194,7 +203,7 @@ export const stagehandHarness: BenchHarness = {
+         agentMode,
+         isCUA,
+         verbose,
+-        configOverrides: { env: config.environment },
++        configOverrides,
+       });
+     }
+ 
+-- 
+2.39.5 (Apple Git-154)
+
