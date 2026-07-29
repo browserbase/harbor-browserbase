@@ -4,17 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 from collections.abc import Generator
 from typing import Any, override
 
-from browserbase import AsyncBrowserbase
+from browserbase import (
+    APIConnectionError,
+    APIStatusError,
+    AsyncBrowserbase,
+    AuthenticationError,
+    Browserbase,
+    PermissionDeniedError,
+)
 from harbor.environments.docker.docker import DockerEnvironment
 
+
+logger = logging.getLogger(__name__)
 
 SESSION_HEALTH_CHECK_INTERVAL_ENV = "BB_SESSION_HEALTH_CHECK_INTERVAL_SEC"
 LEGACY_KEEPALIVE_INTERVAL_ENV = "BB_KEEPALIVE_INTERVAL_SEC"
 DEFAULT_SESSION_HEALTH_CHECK_INTERVAL_SEC: float = 60.0
+
+
+class BrowserbaseCredentialError(RuntimeError):
+    """A rejected Browserbase API key or inaccessible project configuration."""
 
 
 class BrowserbaseEnvironment(DockerEnvironment):
@@ -63,6 +77,8 @@ class BrowserbaseEnvironment(DockerEnvironment):
     @classmethod
     @override
     def preflight(cls) -> None:
+        """Validate configuration with one ``client.projects.retrieve(project_id)`` call."""
+
         super().preflight()
         missing = [
             name
@@ -74,6 +90,54 @@ class BrowserbaseEnvironment(DockerEnvironment):
                 "Missing required Browserbase environment variable(s): "
                 + ", ".join(missing)
             )
+
+        if os.environ.get("BB_SKIP_PREFLIGHT_API_CHECK", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }:
+            logger.warning(
+                "Skipping authenticated Browserbase preflight API check because "
+                "BB_SKIP_PREFLIGHT_API_CHECK is enabled"
+            )
+            return
+
+        client_kwargs = {"api_key": os.environ["BROWSERBASE_API_KEY"]}
+        base_url = os.environ.get("BROWSERBASE_BASE_URL", "").strip()
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        try:
+            # browserbase/resources/projects.py exposes this single-project GET;
+            # SyncAPIClient.__exit__ in _base_client.py closes the HTTP client.
+            with Browserbase(**client_kwargs) as client:
+                client.projects.retrieve(os.environ["BROWSERBASE_PROJECT_ID"])
+        except AuthenticationError as exc:
+            raise BrowserbaseCredentialError(
+                "Browserbase rejected the credential configured by "
+                "BROWSERBASE_API_KEY with HTTP 401; the credential must be replaced."
+            ) from exc
+        except PermissionDeniedError as exc:
+            raise BrowserbaseCredentialError(
+                "Browserbase rejected the credential configured by "
+                "BROWSERBASE_API_KEY for BROWSERBASE_PROJECT_ID with HTTP 403; "
+                "the credential must be replaced."
+            ) from exc
+        except APIConnectionError as exc:
+            raise RuntimeError(
+                "Browserbase credentials could not be checked because the API could "
+                "not be reached."
+            ) from exc
+        except APIStatusError as exc:
+            if exc.status_code == 404:
+                raise BrowserbaseCredentialError(
+                    "Browserbase rejected BROWSERBASE_PROJECT_ID with HTTP 404; "
+                    "the configured project id must be replaced."
+                ) from exc
+            raise RuntimeError(
+                "Browserbase credentials could not be checked because the API returned "
+                f"HTTP {exc.status_code}."
+            ) from exc
 
     def _client(self) -> AsyncBrowserbase:
         if self._browserbase_client is None:
@@ -279,6 +343,7 @@ BrowserbaseDockerEnvironment = BrowserbaseEnvironment
 
 __all__ = [
     "BrowserbaseDockerEnvironment",
+    "BrowserbaseCredentialError",
     "BrowserbaseEnvironment",
     "DEFAULT_SESSION_HEALTH_CHECK_INTERVAL_SEC",
     "LEGACY_KEEPALIVE_INTERVAL_ENV",
