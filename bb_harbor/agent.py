@@ -52,6 +52,15 @@ class StagehandAgentFailedError(RuntimeError):
     """Raised when the Stagehand eval command or trajectory flush fails."""
 
 
+class StagehandRolloutFailedError(StagehandAgentFailedError):
+    """Raised when a flushed Stagehand trajectory declares ``status: error``.
+
+    The recorder shape is evidenced by ``jobs/live-smoke-a4/.../agent/``
+    ``columbia_tuition/2026-07-29T00-14-21-050Z/trajectory.json`` around lines
+    16-20: ``steps``, ``status``, and usage token counts are top-level fields.
+    """
+
+
 class StagehandAgentTaskIdError(StagehandAgentFailedError):
     """Raised when no safe, explicit Stagehand task identity is available."""
 
@@ -64,6 +73,14 @@ _TASK_ID_RE: Final[re.Pattern[str]] = re.compile(
 )
 _FULL_TASK_ID_RE: Final[re.Pattern[str]] = re.compile(rf"^{_TASK_ID_VALUE}$")
 _TASK_ID_MARKER: Final[str] = "stagehand-task-id: <task-id>"
+_DIAGNOSTIC_BLOB_LIMIT: Final[int] = 2_000
+_ERROR_CARRIER_KEYS: Final[tuple[str, ...]] = (
+    "error",
+    "errorMessage",
+    "error_message",
+    "message",
+    "failureReason",
+)
 # Stagehand core utils.ts ~690 defines all Google aliases in this precedence;
 # v3Evaluator.ts ~76 directly consumes the first two for verifier judging.
 _FORWARDED_EXTRA_ENV_NAMES: Final[tuple[str, ...]] = (
@@ -277,6 +294,14 @@ class StagehandAgent(BaseAgent):
                 "requested_trajectory_group": requested_group,
             },
         }
+        # Publish the location in trial metadata for failure diagnosis, but inspect
+        # the recorder's status before writing the success pointer or success log.
+        await self._raise_if_trajectory_errored(
+            environment=environment,
+            trajectory_dir=trajectory_dir,
+            task_id=resolved_task_id,
+            eval_result=result,
+        )
         pointer_parent = posixpath.dirname(TRAJECTORY_POINTER_PATH)
         pointer_command = (
             f"mkdir -p {shlex.quote(pointer_parent)} && "
@@ -294,6 +319,176 @@ class StagehandAgent(BaseAgent):
                 f"{pointer_result.stdout or ''!r}"
             )
         self.logger.info("Stagehand trajectory flushed at %s", trajectory_dir)
+
+    async def _raise_if_trajectory_errored(
+        self,
+        *,
+        environment: BaseEnvironment,
+        trajectory_dir: str,
+        task_id: str,
+        eval_result: ExecResult,
+    ) -> None:
+        """Fail only when readable recorder output positively declares an error.
+
+        ``harbor/environments/base.py`` around line 56 defines ``ExecResult`` with
+        ``return_code``, ``stdout``, and ``stderr``; all three are retained here so
+        a zero-exit CLI failure still leaves actionable Harbor trial diagnostics.
+        """
+
+        trajectory_path = posixpath.join(trajectory_dir, "trajectory.json")
+        command = f"cat {shlex.quote(trajectory_path)}"
+        try:
+            result = await environment.exec(command, timeout_sec=self.timeout_sec)
+        except Exception as exc:
+            self.logger.warning(
+                "Could not read Stagehand trajectory status from %s: %s; continuing",
+                trajectory_path,
+                exc,
+            )
+            return
+
+        if result.return_code != 0:
+            self.logger.warning(
+                "Could not read Stagehand trajectory status from %s; return code %s; "
+                "stderr: %r; stdout: %r; continuing",
+                trajectory_path,
+                result.return_code,
+                result.stderr or "",
+                result.stdout or "",
+            )
+            return
+
+        raw_payload = result.stdout or ""
+        if not raw_payload.strip():
+            self.logger.warning(
+                "Stagehand trajectory %s was empty while checking status; continuing",
+                trajectory_path,
+            )
+            return
+
+        try:
+            payload: object = json.loads(raw_payload)
+        except (TypeError, ValueError) as exc:
+            self.logger.warning(
+                "Could not parse Stagehand trajectory status from %s: %s; continuing",
+                trajectory_path,
+                exc,
+            )
+            return
+
+        if not isinstance(payload, dict):
+            self.logger.warning(
+                "Stagehand trajectory %s was not a JSON object while checking status; "
+                "continuing",
+                trajectory_path,
+            )
+            return
+
+        status = payload.get("status")
+        if not isinstance(status, str) or not status.strip():
+            self.logger.warning(
+                "Stagehand trajectory %s had no string status; continuing",
+                trajectory_path,
+            )
+            return
+        normalized_status = status.strip()
+        if normalized_status.lower() != "error":
+            return
+
+        details = [
+            f"task_id={task_id!r}",
+            f"mode={self.mode!r}",
+            f"trajectory_path={trajectory_path!r}",
+            f"status={normalized_status!r}",
+        ]
+        steps = payload.get("steps")
+        if isinstance(steps, list):
+            details.append(f"step_count={len(steps)}")
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            if "input_tokens" in usage:
+                details.append(f"usage.input_tokens={usage['input_tokens']!r}")
+            if "output_tokens" in usage:
+                details.append(f"usage.output_tokens={usage['output_tokens']!r}")
+
+        diagnostics = self._trajectory_error_diagnostics(payload)
+        if diagnostics:
+            details.append("trajectory diagnostics: " + " | ".join(diagnostics))
+        if eval_result.stdout:
+            details.append(self._captured_stream_diagnostic("stdout", eval_result.stdout))
+        if eval_result.stderr:
+            details.append(self._captured_stream_diagnostic("stderr", eval_result.stderr))
+
+        raise StagehandRolloutFailedError(
+            "Stagehand eval exited successfully, but its flushed trajectory declared "
+            "an errored rollout; "
+            + "; ".join(details)
+        )
+
+    @classmethod
+    def _trajectory_error_diagnostics(cls, payload: dict[str, Any]) -> list[str]:
+        """Extract common recorder/agent error carriers without assuming one schema."""
+
+        scopes: list[tuple[str, dict[str, Any]]] = [("trajectory", payload)]
+        top_error = payload.get("error")
+        if isinstance(top_error, dict):
+            scopes.append(("trajectory.error", top_error))
+
+        steps = payload.get("steps")
+        if isinstance(steps, list) and steps and isinstance(steps[-1], dict):
+            last_step = steps[-1]
+            scopes.append(("last_step", last_step))
+            step_error = last_step.get("error")
+            if isinstance(step_error, dict):
+                scopes.append(("last_step.error", step_error))
+
+        diagnostics: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for scope_name, scope in scopes:
+            for key in _ERROR_CARRIER_KEYS:
+                if key not in scope or scope[key] is None:
+                    continue
+                normalized = cls._normalize_diagnostic_blob(scope[key])
+                if not normalized:
+                    continue
+                identity = (key, normalized)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                diagnostics.append(
+                    f"{scope_name}.{key}: " + cls._truncate_head(normalized)
+                )
+        return diagnostics
+
+    @staticmethod
+    def _normalize_diagnostic_blob(value: object) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            named_parts = [
+                f"{key}={value[key]}"
+                for key in ("name", "message", "stack")
+                if value.get(key) is not None and str(value[key]).strip()
+            ]
+            if named_parts:
+                return "; ".join(named_parts)
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            return str(value).strip()
+
+    @staticmethod
+    def _truncate_head(value: str) -> str:
+        if len(value) <= _DIAGNOSTIC_BLOB_LIMIT:
+            return value
+        return value[:_DIAGNOSTIC_BLOB_LIMIT] + "\n... (truncated)\n[kept head]"
+
+    @staticmethod
+    def _captured_stream_diagnostic(name: str, value: str) -> str:
+        if len(value) <= _DIAGNOSTIC_BLOB_LIMIT:
+            return f"eval {name}: {value}"
+        tail = value[-_DIAGNOSTIC_BLOB_LIMIT:]
+        return f"eval {name}: ... (truncated)\n[kept tail]\n{tail}"
 
     def _resolve_task_id(self, instruction: str) -> str:
         raw_task_id = self.task_id

@@ -4,12 +4,16 @@
 # that literal is embedded in a signed connect URL. BROWSERBASE_PROJECT_ID does
 # not match its sensitive-key regex and survives in jobs output; stripping that
 # identifier before sharing is an operator responsibility and a known gap.
-job_name: browserbase-wtb-smoke
+job_name: browserbase-smoke-suite
 jobs_dir: jobs
-n_concurrent_trials: 2
+# Each trial holds one real Browserbase session, so concurrency is bounded by the
+# Browserbase plan's concurrent-session limit, not local CPU.
+n_concurrent_trials: 3
 
-tasks:
-  - path: tasks/wtb-smoke
+# Harbor validates each child with Task.is_valid_dir; incomplete fixtures are
+# silently skipped, so confirm that the run output reports 10 discovered tasks.
+datasets:
+  - path: tasks
 
 environment:
   import_path: bb_harbor.env:BrowserbaseEnvironment

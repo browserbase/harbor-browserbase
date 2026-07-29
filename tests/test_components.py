@@ -934,12 +934,42 @@ def test_job_config_validates_and_import_paths_resolve(monkeypatch):
         "create_session": False,
         "delete_on_start_failure": True,
     }
-    assert config.n_concurrent_trials == 2
-    assert config.tasks[0].path == Path("tasks/wtb-smoke")
+    assert config.n_concurrent_trials == 3
+    assert config.tasks == []
+    assert len(config.datasets) == 1
+    assert config.datasets[0].path == Path("tasks")
     assert config.agents[0].env["BROWSERBASE_API_KEY"] == "${BROWSERBASE_API_KEY}"
     assert config.agents[0].env["GEMINI_API_KEY"] == "${GEMINI_API_KEY}"
     assert config.verifier.env["GEMINI_API_KEY"] == "${GEMINI_API_KEY}"
     assert config.verifier.kwargs["judge_model"] == "google/gemini-3-flash-preview"
+
+
+@pytest.mark.asyncio
+async def test_job_config_datasets_discover_all_ten_fixtures(monkeypatch):
+    """Guard against a fixture silently failing Task.is_valid_dir and shrinking the suite."""
+
+    repo_root = Path(__file__).resolve().parents[1]
+    payload = yaml.safe_load((repo_root / "job.yaml").read_text())
+    config = JobConfig.model_validate(payload)
+    monkeypatch.chdir(repo_root)
+
+    task_configs = await config.datasets[0].get_task_configs()
+    discovered_names = {task_config.path.name for task_config in task_configs}
+    expected_names = {
+        "agent-all-recipes",
+        "agent-arxiv-gpt-report",
+        "agent-github-react-version",
+        "agent-github-ruby-repo",
+        "agent-hugging-face",
+        "agent-iframe-form",
+        "agent-nba-trades",
+        "agent-sf-library-card",
+        "agent-thegamer-opinion",
+        "wtb-smoke",
+    }
+
+    assert len(task_configs) == 10
+    assert discovered_names == expected_names
 
 
 @pytest.mark.asyncio
