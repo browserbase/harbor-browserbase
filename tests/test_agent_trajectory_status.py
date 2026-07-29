@@ -8,7 +8,11 @@ from pathlib import Path
 import pytest
 
 from bb_harbor import TRAJECTORIES_ROOT, TRAJECTORY_POINTER_PATH
-from bb_harbor.agent import StagehandAgent, StagehandRolloutFailedError
+from bb_harbor.agent import (
+    StagehandAgent,
+    StagehandAgentFailedError,
+    StagehandRolloutFailedError,
+)
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 
@@ -24,12 +28,25 @@ def _script_trajectory(
     *,
     eval_stdout: str | None = None,
     eval_stderr: str | None = None,
+    preview_stdout: str | None = None,
+    preview_stderr: str | None = None,
+    preview_return_code: int = 0,
 ) -> Callable[[str, dict[str, str]], ExecResult]:
     trajectory_path = f"{trajectory_dir}/trajectory.json"
     cat_command = f"cat {shlex.quote(trajectory_path)}"
 
     def script(command: str, env: dict[str, str]) -> ExecResult:
         del env
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(
+                stdout=(
+                    "  Target: agent/columbia_tuition  →  core (1 task)\n"
+                    if preview_stdout is None
+                    else preview_stdout
+                ),
+                stderr=preview_stderr,
+                return_code=preview_return_code,
+            )
         if command.startswith("evals run"):
             return ExecResult(
                 stdout=eval_stdout,
@@ -135,9 +152,11 @@ async def test_zero_score_success_is_left_to_verifier(
     )
     payload = {
         "task": {"id": "agent/columbia_tuition"},
-        "steps": [],
+        # Work evidence is deliberately non-zero: this test isolates scoring,
+        # which remains the verifier's concern, from agent rollout health.
+        "steps": [{"action": "inspect"}],
         "status": "success",
-        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "usage": {"input_tokens": 11, "output_tokens": 2},
         "scores": {"reward": 0.0, "criteria_earned_frac": 0.0},
         "outcomeSuccess": False,
         "criteria_earned_frac": 0.0,
@@ -156,6 +175,83 @@ async def test_zero_score_success_is_left_to_verifier(
     assert any(
         TRAJECTORY_POINTER_PATH in call["command"] for call in environment.calls
     )
+
+
+@pytest.mark.asyncio
+async def test_complete_zero_work_trajectory_raises_without_pointer(
+    tmp_path: Path,
+    agent_factory: Callable[..., StagehandAgent],
+) -> None:
+    trajectory_dir = (
+        f"{TRAJECTORIES_ROOT}/trial/group/agent/columbia_tuition/zero-work-run"
+    )
+    payload = {
+        "task": {"id": "agent/columbia_tuition"},
+        "steps": [],
+        "status": "complete",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0},
+    }
+    environment = RecordingBaseEnvironment(
+        tmp_path,
+        _script_trajectory(
+            trajectory_dir,
+            ExecResult(stdout=json.dumps(payload), return_code=0),
+            eval_stdout="eval-output-marker",
+            eval_stderr="eval-error-marker",
+        ),
+    )
+
+    with pytest.raises(StagehandRolloutFailedError) as excinfo:
+        await agent_factory().run(INSTRUCTION, environment, AgentContext())
+
+    message = str(excinfo.value)
+    assert "task_id='agent/columbia_tuition'" in message
+    assert "did no work" in message
+    assert "usage.cached_tokens=0" in message
+    assert "eval-output-marker" in message
+    assert "eval-error-marker" in message
+    assert not any(
+        TRAJECTORY_POINTER_PATH in call["command"] for call in environment.calls
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("eval_stdout", "eval_stderr"),
+    [
+        ('Error: Unknown option "--task"\n', None),
+        (None, '  Error: Unknown option "--task"\n'),
+        ('\x1b[31mError: Unknown option "--task"\x1b[39m\n', None),
+    ],
+    ids=("stdout", "stderr", "ansi-colored"),
+)
+async def test_zero_exit_cli_failure_signature_raises(
+    tmp_path: Path,
+    agent_factory: Callable[..., StagehandAgent],
+    eval_stdout: str | None,
+    eval_stderr: str | None,
+) -> None:
+    trajectory_dir = (
+        f"{TRAJECTORIES_ROOT}/trial/group/agent/columbia_tuition/unused-run"
+    )
+    environment = RecordingBaseEnvironment(
+        tmp_path,
+        _script_trajectory(
+            trajectory_dir,
+            ExecResult(stdout="{}", return_code=0),
+            eval_stdout=eval_stdout,
+            eval_stderr=eval_stderr,
+        ),
+    )
+
+    with pytest.raises(StagehandAgentFailedError) as excinfo:
+        await agent_factory().run(INSTRUCTION, environment, AgentContext())
+
+    message = str(excinfo.value)
+    assert 'Unknown option "--task"' in message
+    assert "return_code=0" in message
+    assert "eval stdout:" in message
+    assert "eval stderr:" in message
 
 
 @pytest.mark.asyncio

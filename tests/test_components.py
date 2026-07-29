@@ -46,6 +46,9 @@ REWARD_KEYS = {
     "criteria_earned_frac",
 }
 INSTRUCTION = "stagehand-task-id: agent/columbia_tuition"
+SUCCESSFUL_EVAL_PREVIEW = (
+    "  Target: agent/columbia_tuition  →  core (1 task)\n"
+)
 
 
 def test_harbor_contract_and_components_are_concrete():
@@ -81,6 +84,8 @@ async def test_browserbase_scopes_are_isolated_across_interleaved_tasks(
 
     async def script(command, merged_env):
         nonlocal entered
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("evals run"):
             async with entered_lock:
                 entered += 1
@@ -112,8 +117,18 @@ async def test_browserbase_scopes_are_isolated_across_interleaved_tasks(
         agent_factory().run(INSTRUCTION, env_b, AgentContext()),
     )
 
-    eval_a = next(call for call in env_a.calls if call["command"].startswith("evals run"))
-    eval_b = next(call for call in env_b.calls if call["command"].startswith("evals run"))
+    eval_a = next(
+        call
+        for call in env_a.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
+    )
+    eval_b = next(
+        call
+        for call in env_b.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
+    )
     assert eval_a["env"]["BROWSERBASE_SESSION_ID"] == "bb-a"
     assert eval_b["env"]["BROWSERBASE_SESSION_ID"] == "bb-b"
     assert all(call["env"].get("BROWSERBASE_SESSION_ID") != "bb-b" for call in env_a.calls)
@@ -293,6 +308,8 @@ async def test_default_start_leaves_session_creation_to_stagehand(
     trajectory_dir = f"{TRAJECTORIES_ROOT}/default/group/agent/columbia_tuition/run"
 
     def script(command, merged_env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(
                 stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
@@ -310,7 +327,10 @@ async def test_default_start_leaves_session_creation_to_stagehand(
     await agent_factory().run(INSTRUCTION, environment, AgentContext())
 
     eval_call = next(
-        call for call in environment.calls if call["command"].startswith("evals run")
+        call
+        for call in environment.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
     )
     assert sessions.create_calls == []
     assert environment.browserbase_session_id is None
@@ -506,6 +526,8 @@ async def test_agent_uses_explicit_browserbase_flag_without_session_scope(
     trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
 
     def script(command, env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(
                 stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
@@ -519,7 +541,10 @@ async def test_agent_uses_explicit_browserbase_flag_without_session_scope(
     await agent_factory().run(INSTRUCTION, environment, AgentContext())
 
     eval_call = next(
-        call for call in environment.calls if call["command"].startswith("evals run")
+        call
+        for call in environment.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
     )
     assert eval_call["env"]["BROWSERBASE_SESSION_ID"] == "fallback-session"
     assert eval_call["env"]["BROWSERBASE_CONNECT_URL"] == "wss://fallback"
@@ -546,6 +571,8 @@ async def test_callable_session_scope_does_not_imply_browserbase(
     trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
 
     def script(command, merged_env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(
                 stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
@@ -559,7 +586,10 @@ async def test_callable_session_scope_does_not_imply_browserbase(
     await agent_factory().run(INSTRUCTION, environment, AgentContext())
 
     eval_call = next(
-        call for call in environment.calls if call["command"].startswith("evals run")
+        call
+        for call in environment.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
     )
     assert "--env browserbase" not in eval_call["command"]
     assert "SHOULD_NOT_BE_INJECTED" not in eval_call["env"]
@@ -574,6 +604,8 @@ async def test_agent_forwards_present_provider_keys_without_inventing_absent_one
     trajectory_dir = f"{TRAJECTORIES_ROOT}/plain/group/agent/columbia_tuition/run"
 
     def script(command, env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(
                 stdout=f"1\t12\t{trajectory_dir}/trajectory.json\n", return_code=0
@@ -585,14 +617,20 @@ async def test_agent_forwards_present_provider_keys_without_inventing_absent_one
         INSTRUCTION, with_key, AgentContext()
     )
     eval_with_key = next(
-        call for call in with_key.calls if call["command"].startswith("evals run")
+        call
+        for call in with_key.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
     )
     assert eval_with_key["env"]["GEMINI_API_KEY"] == "provider-key"
 
     without_key = RecordingBaseEnvironment(tmp_path, script, session_id="without-key")
     await agent_factory(extra_env={}).run(INSTRUCTION, without_key, AgentContext())
     eval_without_key = next(
-        call for call in without_key.calls if call["command"].startswith("evals run")
+        call
+        for call in without_key.calls
+        if call["command"].startswith("evals run")
+        and "--preview" not in shlex.split(call["command"])
     )
     for name in (
         "GEMINI_API_KEY",
@@ -852,6 +890,8 @@ async def test_agent_rejects_missing_or_empty_trajectory(
     """Required assertion 9: successful eval without a nonempty trajectory fails."""
 
     def script(command, env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(stdout=find_stdout, return_code=0)
         return ExecResult(return_code=0)
@@ -874,6 +914,8 @@ async def test_agent_publishes_trajectory_metadata_and_pointer(
     )
 
     def script(command, env):
+        if command.startswith("evals run") and "--preview" in shlex.split(command):
+            return ExecResult(stdout=SUCCESSFUL_EVAL_PREVIEW, return_code=0)
         if command.startswith("find "):
             return ExecResult(
                 stdout=f"1\t42\t{trajectory_dir}/trajectory.json\n", return_code=0

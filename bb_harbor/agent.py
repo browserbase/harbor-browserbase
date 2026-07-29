@@ -53,7 +53,7 @@ class StagehandAgentFailedError(RuntimeError):
 
 
 class StagehandRolloutFailedError(StagehandAgentFailedError):
-    """Raised when a flushed Stagehand trajectory declares ``status: error``.
+    """Raised when a flushed Stagehand trajectory is errored or did no work.
 
     The recorder shape is evidenced by ``jobs/live-smoke-a4/.../agent/``
     ``columbia_tuition/2026-07-29T00-14-21-050Z/trajectory.json`` around lines
@@ -74,6 +74,29 @@ _TASK_ID_RE: Final[re.Pattern[str]] = re.compile(
 _FULL_TASK_ID_RE: Final[re.Pattern[str]] = re.compile(rf"^{_TASK_ID_VALUE}$")
 _TASK_ID_MARKER: Final[str] = "stagehand-task-id: <task-id>"
 _DIAGNOSTIC_BLOB_LIMIT: Final[int] = 2_000
+# cli.ts line 176 prefixes top-level argv failures with this text; parse.ts line
+# 234 supplies ``Unknown option "..."`` and commandTree.ts lines 371-377 supply
+# ``Unknown command "..."...`` as the message that follows it.
+_CLI_FAILURE_SIGNATURES: Final[tuple[str, ...]] = ("Error: ",)
+_ANSI_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
+_CLI_FAILURE_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    rf"^[ \t]*(?:{'|'.join(re.escape(value) for value in _CLI_FAILURE_SIGNATURES)})",
+    re.MULTILINE,
+)
+# preview.ts line 85 emits this lower-case failure branch with two leading spaces.
+_PREVIEW_ERROR_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[ \t]*error:[ \t]+", re.MULTILINE
+)
+# preview.ts lines 101-107 render successful plans with this header and task count.
+_PREVIEW_HEADER_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[ \t]*Target:[ \t]+(?P<target>.+?)[ \t]+→[ \t]+.+[ \t]+"
+    r"\((?P<task_count>\d+)[ \t]+tasks?\)[ \t]*$",
+    re.MULTILINE,
+)
+# run.ts lines 228-235 puts this text in the preview error payload for no matches.
+_NO_RUNNABLE_TASKS_SIGNATURE: Final[str] = 'No runnable tasks found matching "'
 _ERROR_CARRIER_KEYS: Final[tuple[str, ...]] = (
     "error",
     "errorMessage",
@@ -170,15 +193,32 @@ class StagehandAgent(BaseAgent):
         return resolved
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Verify that the non-interactive evals help path is available."""
+        """Verify the CLI and any constructor-known task plan.
+
+        Harbor supplies no instruction to ``setup``, so only an explicit constructor
+        ``task_id`` can be previewed here. Marker-derived ids are previewed in ``run``.
+        ``preview.ts`` lines 79-107 show that ``--preview`` renders a plan without
+        entering the run renderer and exposes its resolved target and task count.
+        """
 
         self.logger.info("Checking for the Stagehand evals CLI")
-        result = await environment.exec("evals --help", timeout_sec=self.timeout_sec)
+        probe_command = "evals --help"
+        result = await environment.exec(probe_command, timeout_sec=self.timeout_sec)
+        self._raise_if_cli_failed(result, command=probe_command)
         if result.return_code != 0:
             raise StagehandAgentFailedError(
                 "Stagehand evals CLI probe `evals --help` failed with return code "
                 f"{result.return_code}. stderr: {result.stderr or ''!r}; "
                 f"stdout: {result.stdout or ''!r}"
+            )
+        if self.task_id is not None:
+            resolved_task_id = self._resolve_task_id("")
+            await self._validate_eval_plan(
+                environment,
+                resolved_task_id,
+                use_browserbase=bool(
+                    getattr(environment, "uses_browserbase", False)
+                ),
             )
 
     async def run(
@@ -269,13 +309,19 @@ class StagehandAgent(BaseAgent):
                     if browserbase_connect_url:
                         scoped_env["BROWSERBASE_CONNECT_URL"] = browserbase_connect_url
             stack.enter_context(environment.scoped_exec_env(scoped_env))
+            await self._validate_eval_plan(
+                environment,
+                resolved_task_id,
+                use_browserbase=uses_browserbase,
+            )
             result = await environment.exec(command, timeout_sec=self.timeout_sec)
 
+        self._raise_if_cli_failed(result, command=command)
         if result.return_code != 0:
             raise StagehandAgentFailedError(
                 f"Stagehand eval {resolved_task_id!r} failed with return code "
-                f"{result.return_code}; stderr: {result.stderr or ''!r}; "
-                f"stdout: {result.stdout or ''!r}"
+                f"{result.return_code}; command={command!r}; "
+                + self._exec_stream_diagnostics(result)
             )
 
         trajectory_dir = await self._locate_flushed_trajectory(
@@ -296,7 +342,7 @@ class StagehandAgent(BaseAgent):
         }
         # Publish the location in trial metadata for failure diagnosis, but inspect
         # the recorder's status before writing the success pointer or success log.
-        await self._raise_if_trajectory_errored(
+        await self._raise_if_trajectory_unusable(
             environment=environment,
             trajectory_dir=trajectory_dir,
             task_id=resolved_task_id,
@@ -320,7 +366,7 @@ class StagehandAgent(BaseAgent):
             )
         self.logger.info("Stagehand trajectory flushed at %s", trajectory_dir)
 
-    async def _raise_if_trajectory_errored(
+    async def _raise_if_trajectory_unusable(
         self,
         *,
         environment: BaseEnvironment,
@@ -328,11 +374,14 @@ class StagehandAgent(BaseAgent):
         task_id: str,
         eval_result: ExecResult,
     ) -> None:
-        """Fail only when readable recorder output positively declares an error.
+        """Fail on positive recorder evidence of an error or a zero-work rollout.
 
         ``harbor/environments/base.py`` around line 56 defines ``ExecResult`` with
         ``return_code``, ``stdout``, and ``stderr``; all three are retained here so
         a zero-exit CLI failure still leaves actionable Harbor trial diagnostics.
+        The recorder shape is evidenced by ``jobs/live-smoke-a4/.../agent/``
+        ``columbia_tuition/2026-07-29T00-14-21-050Z/trajectory.json`` around lines
+        16-20: ``steps``, ``status``, and usage token counts are top-level fields.
         """
 
         trajectory_path = posixpath.join(trajectory_dir, "trajectory.json")
@@ -384,15 +433,53 @@ class StagehandAgent(BaseAgent):
             )
             return
 
-        status = payload.get("status")
-        if not isinstance(status, str) or not status.strip():
+        raw_status = payload.get("status")
+        normalized_status: str | None = None
+        if not isinstance(raw_status, str) or not raw_status.strip():
             self.logger.warning(
                 "Stagehand trajectory %s had no string status; continuing",
                 trajectory_path,
             )
-            return
-        normalized_status = status.strip()
-        if normalized_status.lower() != "error":
+        else:
+            normalized_status = raw_status.strip()
+
+        steps = payload.get("steps")
+        step_count: int | None = None
+        if isinstance(steps, list):
+            step_count = len(steps)
+        else:
+            self.logger.warning(
+                "Stagehand trajectory %s had no steps list; step count is unknown",
+                trajectory_path,
+            )
+
+        usage = payload.get("usage")
+        token_counts: list[tuple[str, int | float]] = []
+        if isinstance(usage, dict):
+            token_counts = [
+                (str(key), value)
+                for key, value in usage.items()
+                if "tokens" in str(key).lower()
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ]
+        if not token_counts:
+            self.logger.warning(
+                "Stagehand trajectory %s had no numeric usage token fields; token "
+                "usage is unknown",
+                trajectory_path,
+            )
+
+        errored = (
+            normalized_status is not None
+            and normalized_status.lower() == "error"
+        )
+        zero_work = (
+            step_count == 0
+            and bool(token_counts)
+            and all(value == 0 for _, value in token_counts)
+        )
+        if not errored and not zero_work:
             return
 
         details = [
@@ -401,29 +488,37 @@ class StagehandAgent(BaseAgent):
             f"trajectory_path={trajectory_path!r}",
             f"status={normalized_status!r}",
         ]
-        steps = payload.get("steps")
-        if isinstance(steps, list):
-            details.append(f"step_count={len(steps)}")
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
-            if "input_tokens" in usage:
-                details.append(f"usage.input_tokens={usage['input_tokens']!r}")
-            if "output_tokens" in usage:
-                details.append(f"usage.output_tokens={usage['output_tokens']!r}")
+        details.append(
+            "step_count=unknown" if step_count is None else f"step_count={step_count}"
+        )
+        if token_counts:
+            details.extend(
+                f"usage.{name}={value!r}" for name, value in token_counts
+            )
+        else:
+            details.append("usage_token_counts=unknown")
 
         diagnostics = self._trajectory_error_diagnostics(payload)
         if diagnostics:
             details.append("trajectory diagnostics: " + " | ".join(diagnostics))
-        if eval_result.stdout:
-            details.append(self._captured_stream_diagnostic("stdout", eval_result.stdout))
-        if eval_result.stderr:
-            details.append(self._captured_stream_diagnostic("stderr", eval_result.stderr))
-
-        raise StagehandRolloutFailedError(
-            "Stagehand eval exited successfully, but its flushed trajectory declared "
-            "an errored rollout; "
-            + "; ".join(details)
+        details.append(
+            self._captured_stream_diagnostic("stdout", eval_result.stdout or "")
         )
+        details.append(
+            self._captured_stream_diagnostic("stderr", eval_result.stderr or "")
+        )
+
+        if errored:
+            message = (
+                "Stagehand eval exited successfully, but its flushed trajectory "
+                "declared an errored rollout; "
+            )
+        else:
+            message = (
+                "Stagehand rollout completed but did no work and consumed no tokens; "
+                "this is never a legitimate rollout here; "
+            )
+        raise StagehandRolloutFailedError(message + "; ".join(details))
 
     @classmethod
     def _trajectory_error_diagnostics(cls, payload: dict[str, Any]) -> list[str]:
@@ -562,7 +657,15 @@ class StagehandAgent(BaseAgent):
                 scoped_env[name] = value
         return scoped_env
 
-    def _build_eval_command(self, task_id: str, *, use_browserbase: bool) -> str:
+    def _build_eval_command(
+        self,
+        task_id: str,
+        *,
+        use_browserbase: bool,
+        preview: bool = False,
+    ) -> str:
+        """Build argv matching ``commands/parse.ts`` lines 208-234."""
+
         argv = [
             "evals",
             "run",
@@ -578,7 +681,84 @@ class StagehandAgent(BaseAgent):
             argv.extend(("--env", "browserbase"))
         if self.model_name is not None:
             argv.extend(("--model", self.model_name))
+        if preview:
+            argv.append("--preview")
         return " ".join(shlex.quote(value) for value in argv)
+
+    async def _validate_eval_plan(
+        self,
+        environment: BaseEnvironment,
+        task_id: str,
+        *,
+        use_browserbase: bool,
+    ) -> None:
+        """Require a successful ``preview.ts`` lines 79-107 resolved-plan header."""
+
+        command = self._build_eval_command(
+            task_id,
+            use_browserbase=use_browserbase,
+            preview=True,
+        )
+        result = await environment.exec(command, timeout_sec=self.timeout_sec)
+        self._raise_if_cli_failed(result, command=command)
+        if result.return_code != 0:
+            raise StagehandAgentFailedError(
+                f"Stagehand eval preview for {task_id!r} failed with return code "
+                f"{result.return_code}; command={command!r}; "
+                + self._exec_stream_diagnostics(result)
+            )
+        rendered = self._strip_ansi(
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )
+        header = _PREVIEW_HEADER_RE.search(rendered)
+        preview_error = _PREVIEW_ERROR_LINE_RE.search(rendered)
+        no_runnable_tasks = _NO_RUNNABLE_TASKS_SIGNATURE in rendered
+        rendered_target = header.group("target").strip() if header else None
+        task_count = int(header.group("task_count")) if header else None
+        if (
+            preview_error
+            or no_runnable_tasks
+            or rendered_target != task_id
+            or task_count is None
+            or task_count < 1
+        ):
+            raise StagehandAgentFailedError(
+                f"Stagehand eval preview did not resolve a runnable plan for "
+                f"{task_id!r}; rendered_target={rendered_target!r}; "
+                f"task_count={task_count!r}; command={command!r}; "
+                f"return_code={result.return_code}; "
+                + self._exec_stream_diagnostics(result)
+            )
+
+    @classmethod
+    def _raise_if_cli_failed(cls, result: ExecResult, *, command: str) -> None:
+        """Detect ``cli.ts`` line 176 failures even when the process reports zero."""
+
+        captured = cls._strip_ansi(
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )
+        if not _CLI_FAILURE_LINE_RE.search(captured):
+            return
+        raise StagehandAgentFailedError(
+            f"Stagehand eval CLI reported a failure; command={command!r}; "
+            f"return_code={result.return_code}; "
+            + cls._exec_stream_diagnostics(result)
+        )
+
+    @staticmethod
+    def _strip_ansi(value: str) -> str:
+        return _ANSI_ESCAPE_RE.sub("", value)
+
+    @classmethod
+    def _exec_stream_diagnostics(cls, result: ExecResult) -> str:
+        """Retain both bounded streams using the established head/tail markers."""
+
+        return "; ".join(
+            (
+                cls._captured_stream_diagnostic("stdout", result.stdout or ""),
+                cls._captured_stream_diagnostic("stderr", result.stderr or ""),
+            )
+        )
 
     async def _locate_flushed_trajectory(
         self,
