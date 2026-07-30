@@ -139,6 +139,29 @@ defaults to `false` and `job.yaml` preserves that setting. Setting it to `true` 
 second session and causes double billing unless Stagehand is patched to forward
 `browserbaseSessionID` to `initV3`.
 
+### Browserbase session id is recorded per trial
+
+Because `create_session: false`, canonical Stagehand creates and owns the session, so Harbor never
+learns its id from the Browserbase SDK. Instead, the agent captures the id from the eval run's own
+output. Stagehand emits a `Browserbase session started` line containing the unsigned
+`https://www.browserbase.com/sessions/<id>` dashboard URL at verbosity level 1. Before the eval,
+the agent runs `evals config set verbose true` in the task image so that line is emitted. If the
+command fails, the agent warns and continues; capture is best-effort and never fails the trial.
+
+Each trial records the id in two places. Agent trial metadata stores
+`browserbase_session_id`, `browserbase_session_url`, and `browserbase_session_ids` under the
+`stagehand` block; the last key contains the full list, normally of length one. The artifact
+`<trial>/agent/browserbase_session.json` stores `session_id`, `session_url`, `debug_url`, `task_id`,
+`mode`, and `all_session_ids`. Only the unsigned dashboard URL is written. No signed connect URL,
+`wss://` URL, or API key is recorded. `SESSION-ID-VERIFY.md` contains the live verification of
+per-trial attribution.
+
+The `debug_url` field is currently always `null`. Its extractor expects a JSON-shaped
+`"debugUrl": {"value": …}` rendering, but Stagehand logs `auxiliary` fields as plain text, so the
+pattern does not match in practice. This fails safe: the field remains `null`, no signed URL is
+written, and session-id capture is unaffected. The dead extraction path should be removed or
+re-pointed at the actual log rendering.
+
 ### `BROWSERBASE_PROJECT_ID` scrubbing gap
 
 Harbor's secret scrubber collects only values whose key name matches its sensitive-key pattern:
