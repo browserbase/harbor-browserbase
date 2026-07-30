@@ -115,8 +115,7 @@ Run all ten fixtures with:
 keep concurrency within the Browserbase plan's session limit. Harbor silently skips incomplete
 task directories; confirm that run output reports ten discovered tasks.
 
-See `SMOKE-SUITE.md` for the long-form procedure and `SMOKE-RESULTS.md` for the authoritative
-record of the latest verified run. That run completed real work in 10/10 trials and 6/10 scored
+The latest verified run completed real work in 10/10 trials and 6/10 scored
 `reward > 0`. The four zero-reward trials were genuine agent failures — hallucinated answers, a
 dropped task constraint, a consent wall — not integration defects.
 
@@ -153,8 +152,8 @@ Each trial records the id in two places. Agent trial metadata stores
 `stagehand` block; the last key contains the full list, normally of length one. The artifact
 `<trial>/agent/browserbase_session.json` stores `session_id`, `session_url`, `debug_url`, `task_id`,
 `mode`, and `all_session_ids`. Only the unsigned dashboard URL is written. No signed connect URL,
-`wss://` URL, or API key is recorded. `SESSION-ID-VERIFY.md` contains the live verification of
-per-trial attribution.
+`wss://` URL, or API key is recorded. Per-trial attribution has been verified live against the
+Browserbase API on concurrent trials.
 
 The `debug_url` field is currently always `null`. Its extractor expects a JSON-shaped
 `"debugUrl": {"value": …}` rendering, but Stagehand logs `auxiliary` fields as plain text, so the
