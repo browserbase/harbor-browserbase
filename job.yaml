@@ -31,6 +31,9 @@ agents:
     env:
       BROWSERBASE_API_KEY: ${BROWSERBASE_API_KEY}
       BROWSERBASE_PROJECT_ID: ${BROWSERBASE_PROJECT_ID}
+      # The AI SDK Google provider needs this name for the agent model;
+      # Stagehand and judge paths continue to use GEMINI_API_KEY.
+      GOOGLE_GENERATIVE_AI_API_KEY: ${GOOGLE_GENERATIVE_AI_API_KEY}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
 
 verifier:
