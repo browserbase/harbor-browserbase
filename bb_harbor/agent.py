@@ -81,6 +81,19 @@ _CLI_FAILURE_SIGNATURES: Final[tuple[str, ...]] = ("Error: ",)
 _ANSI_ESCAPE_RE: Final[re.Pattern[str]] = re.compile(
     r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
 )
+_SESSION_CAPTURE_COLUMNS: Final[int] = 400
+_BROWSERBASE_SESSION_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"https://www\.browserbase\.com/sessions/"
+    r"(?P<session_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"(?![0-9a-fA-F-])"
+)
+_STAGEHAND_DEBUG_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r'"debugUrl"\s*:\s*\{\s*"value"\s*:\s*"(?P<url>[^"]*)"'
+)
+_SAFE_BROWSERBASE_DEBUG_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"^https://(?:www\.)?browserbase\.com/[A-Za-z0-9._~/-]*$"
+)
 _CLI_FAILURE_LINE_RE: Final[re.Pattern[str]] = re.compile(
     rf"^[ \t]*(?:{'|'.join(re.escape(value) for value in _CLI_FAILURE_SIGNATURES)})",
     re.MULTILINE,
@@ -156,6 +169,7 @@ class StagehandAgent(BaseAgent):
         self._version_resolved: bool = False
         self._cached_version: str | None = None
         self._instance_id: str = uuid4().hex
+        self._session_capture_enabled: bool | None = None
 
     @staticmethod
     def name() -> str:
@@ -314,13 +328,26 @@ class StagehandAgent(BaseAgent):
                 resolved_task_id,
                 use_browserbase=uses_browserbase,
             )
-            result = await environment.exec(command, timeout_sec=self.timeout_sec)
+            await self._enable_session_capture(environment)
+            run_command = (
+                self._wrap_for_session_capture(command)
+                if self._session_capture_enabled
+                else command
+            )
+            result = await environment.exec(
+                run_command, timeout_sec=self.timeout_sec
+            )
+            self._publish_browserbase_session(
+                context=context,
+                task_id=resolved_task_id,
+                result=result,
+            )
 
-        self._raise_if_cli_failed(result, command=command)
+        self._raise_if_cli_failed(result, command=run_command)
         if result.return_code != 0:
             raise StagehandAgentFailedError(
                 f"Stagehand eval {resolved_task_id!r} failed with return code "
-                f"{result.return_code}; command={command!r}; "
+                f"{result.return_code}; command={run_command!r}; "
                 + self._exec_stream_diagnostics(result)
             )
 
@@ -330,15 +357,19 @@ class StagehandAgent(BaseAgent):
             task_id=resolved_task_id,
         )
         self.trajectory_dir = trajectory_dir
-        context.metadata = {
-            **(context.metadata or {}),
-            "stagehand": {
+        stagehand_meta = dict((context.metadata or {}).get("stagehand") or {})
+        stagehand_meta.update(
+            {
                 "task_id": resolved_task_id,
                 "mode": self.mode,
                 "trajectory_dir": trajectory_dir,
                 "trajectory_root": trajectory_root,
                 "requested_trajectory_group": requested_group,
-            },
+            }
+        )
+        context.metadata = {
+            **(context.metadata or {}),
+            "stagehand": stagehand_meta,
         }
         # Publish the location in trial metadata for failure diagnosis, but inspect
         # the recorder's status before writing the success pointer or success log.
@@ -365,6 +396,182 @@ class StagehandAgent(BaseAgent):
                 f"{pointer_result.stdout or ''!r}"
             )
         self.logger.info("Stagehand trajectory flushed at %s", trajectory_dir)
+
+    async def _enable_session_capture(
+        self, environment: BaseEnvironment
+    ) -> None:
+        """Best-effort enable the only verified Stagehand session-id output path.
+
+        ``packages/core/lib/v3/v3.ts:1193-1206`` emits the session URL at level
+        one. ``packages/evals/tui/commands/parse.ts:488`` reads verbosity only
+        from ``evals.config.json``, while ``packages/evals/utils.ts:105-116`` clips
+        output to the pty width. A 400-column util-linux ``script`` pty preserves
+        the URL and ``script -e`` propagates the eval process return code.
+        """
+
+        if self._session_capture_enabled is not None:
+            return
+
+        probe_command = (
+            "command -v script >/dev/null 2>&1 && "
+            "command -v stty >/dev/null 2>&1"
+        )
+        try:
+            probe_result = await environment.exec(
+                probe_command, timeout_sec=self.timeout_sec
+            )
+        except Exception as exc:
+            self._session_capture_enabled = False
+            self.logger.warning(
+                "Browserbase session capture capability probe failed: %s; "
+                "continuing without pty capture",
+                exc,
+            )
+            return
+        if probe_result.return_code != 0:
+            self._session_capture_enabled = False
+            self.logger.warning(
+                "Browserbase session capture requires script and stty; "
+                "continuing without pty capture"
+            )
+            return
+
+        config_command = "evals config set verbose true"
+        try:
+            config_result = await environment.exec(
+                config_command, timeout_sec=self.timeout_sec
+            )
+        except Exception as exc:
+            self._session_capture_enabled = False
+            self.logger.warning(
+                "Could not enable verbose Stagehand output for Browserbase session "
+                "capture: %s; continuing without pty capture",
+                exc,
+            )
+            return
+        if config_result.return_code != 0:
+            self._session_capture_enabled = False
+            self.logger.warning(
+                "Could not enable verbose Stagehand output for Browserbase session "
+                "capture (return code %s); continuing without pty capture",
+                config_result.return_code,
+            )
+            return
+        self._session_capture_enabled = True
+
+    @staticmethod
+    def _wrap_for_session_capture(command: str) -> str:
+        """Run only the eval command in the verified 400-column pty wrapper."""
+
+        inner = f"stty cols {_SESSION_CAPTURE_COLUMNS}; {command}"
+        return f"script -q -e -c {shlex.quote(inner)} /dev/null"
+
+    @classmethod
+    def _extract_browserbase_session_ids(cls, captured: str) -> list[str]:
+        """Return distinct complete session UUIDs in first-seen order."""
+
+        rendered = cls._strip_ansi(captured)
+        return list(
+            dict.fromkeys(
+                match.group("session_id")
+                for match in _BROWSERBASE_SESSION_URL_RE.finditer(rendered)
+            )
+        )
+
+    @staticmethod
+    def _safe_browserbase_debug_url(candidate: str | None) -> str | None:
+        """Allow only unsigned browserbase.com HTTPS paths for persistence."""
+
+        if candidate is None:
+            return None
+        return (
+            candidate
+            if _SAFE_BROWSERBASE_DEBUG_URL_RE.fullmatch(candidate)
+            else None
+        )
+
+    @classmethod
+    def _extract_safe_debug_url(cls, captured: str) -> str | None:
+        """Return the last captured debug URL that passes the strict allowlist."""
+
+        rendered = cls._strip_ansi(captured)
+        safe_candidates = [
+            safe
+            for match in _STAGEHAND_DEBUG_URL_RE.finditer(rendered)
+            if (safe := cls._safe_browserbase_debug_url(match.group("url")))
+            is not None
+        ]
+        return safe_candidates[-1] if safe_candidates else None
+
+    def _publish_browserbase_session(
+        self,
+        *,
+        context: AgentContext,
+        task_id: str,
+        result: ExecResult,
+    ) -> None:
+        """Persist a safe per-trial Browserbase audit record; never fail a trial."""
+
+        try:
+            captured = (result.stdout or "") + "\n" + (result.stderr or "")
+            session_ids = self._extract_browserbase_session_ids(captured)
+            if not session_ids:
+                self.logger.warning(
+                    "No Browserbase session id was captured for Stagehand task %s",
+                    task_id,
+                )
+                return
+
+            if len(session_ids) > 1:
+                self.logger.warning(
+                    "Captured %s distinct Browserbase session ids for Stagehand "
+                    "task %s; using the most recent",
+                    len(session_ids),
+                    task_id,
+                )
+            session_id = session_ids[-1]
+            session_url = f"https://www.browserbase.com/sessions/{session_id}"
+            stagehand_meta = dict((context.metadata or {}).get("stagehand") or {})
+            stagehand_meta.update(
+                {
+                    "browserbase_session_id": session_id,
+                    "browserbase_session_url": session_url,
+                    "browserbase_session_ids": session_ids,
+                }
+            )
+            context.metadata = {
+                **(context.metadata or {}),
+                "stagehand": stagehand_meta,
+            }
+
+            artifact_path = Path(self.logs_dir) / "browserbase_session.json"
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact = {
+                "session_id": session_id,
+                "session_url": session_url,
+                "debug_url": self._extract_safe_debug_url(captured),
+                "task_id": task_id,
+                "mode": self.mode,
+                "all_session_ids": session_ids,
+            }
+            artifact_path.write_text(
+                json.dumps(artifact, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            self.logger.info(
+                "Captured Browserbase session %s for Stagehand task %s in %s mode "
+                "at %s",
+                session_id,
+                task_id,
+                self.mode,
+                artifact_path,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                "Could not publish Browserbase session for Stagehand task %s: %s",
+                task_id,
+                exc,
+            )
 
     async def _raise_if_trajectory_unusable(
         self,

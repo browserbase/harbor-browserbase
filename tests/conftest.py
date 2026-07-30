@@ -19,9 +19,17 @@ from harbor.models.trial.paths import TrialPaths
 class RecordingBaseEnvironment(BaseEnvironment):
     """Minimal concrete environment retaining Harbor's real scoped env merge."""
 
-    def __init__(self, tmp_path: Path, script=None, *, session_id: str = "trial__env"):
+    def __init__(
+        self,
+        tmp_path: Path,
+        script=None,
+        *,
+        session_id: str = "trial__env",
+        supports_session_capture: bool = False,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.script = script
+        self.supports_session_capture = supports_session_capture
         super().__init__(
             environment_dir=tmp_path,
             environment_name="recording",
@@ -74,6 +82,10 @@ class RecordingBaseEnvironment(BaseEnvironment):
                 "user": user,
             }
         )
+        if command.startswith("command -v script "):
+            return ExecResult(return_code=0 if self.supports_session_capture else 1)
+        if command == "evals config set verbose true":
+            return ExecResult(return_code=0 if self.supports_session_capture else 1)
         if self.script is None:
             return ExecResult(return_code=0)
         result = self.script(command, merged_env)
@@ -85,9 +97,16 @@ class RecordingBaseEnvironment(BaseEnvironment):
 class RecordingBrowserbaseEnvironment(BrowserbaseEnvironment):
     """Browserbase environment double that keeps the real session scope and merge."""
 
-    def __init__(self, *args, script=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        script=None,
+        supports_session_capture: bool = False,
+        **kwargs,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.script = script
+        self.supports_session_capture = supports_session_capture
         super().__init__(*args, **kwargs)
 
     async def exec(
@@ -109,6 +128,10 @@ class RecordingBrowserbaseEnvironment(BrowserbaseEnvironment):
                 "user": user,
             }
         )
+        if command.startswith("command -v script "):
+            return ExecResult(return_code=0 if self.supports_session_capture else 1)
+        if command == "evals config set verbose true":
+            return ExecResult(return_code=0 if self.supports_session_capture else 1)
         if self.script is None:
             return ExecResult(return_code=0)
         result = self.script(command, merged_env)
@@ -176,6 +199,7 @@ def browserbase_env_factory(tmp_path):
         script=None,
         create_session: bool = False,
         delete_on_start_failure: bool = True,
+        supports_session_capture: bool = False,
     ) -> RecordingBrowserbaseEnvironment:
         environment_dir = tmp_path / f"environment-{session_id}"
         environment_dir.mkdir()
@@ -190,6 +214,7 @@ def browserbase_env_factory(tmp_path):
             script=script,
             create_session=create_session,
             delete_on_start_failure=delete_on_start_failure,
+            supports_session_capture=supports_session_capture,
         )
 
     return factory
