@@ -115,8 +115,7 @@ Run all ten fixtures with:
 keep concurrency within the Browserbase plan's session limit. Harbor silently skips incomplete
 task directories; confirm that run output reports ten discovered tasks.
 
-See `SMOKE-SUITE.md` for the long-form procedure and `SMOKE-RESULTS.md` for the authoritative
-record of the latest verified run. That run completed real work in 10/10 trials and 6/10 scored
+The latest verified run completed real work in 10/10 trials and 6/10 scored
 `reward > 0`. The four zero-reward trials were genuine agent failures — hallucinated answers, a
 dropped task constraint, a consent wall — not integration defects.
 
@@ -138,6 +137,29 @@ Canonical Stagehand owns the Browserbase session, so `BrowserbaseEnvironment.cre
 defaults to `false` and `job.yaml` preserves that setting. Setting it to `true` creates an inert
 second session and causes double billing unless Stagehand is patched to forward
 `browserbaseSessionID` to `initV3`.
+
+### Browserbase session id is recorded per trial
+
+Because `create_session: false`, canonical Stagehand creates and owns the session, so Harbor never
+learns its id from the Browserbase SDK. Instead, the agent captures the id from the eval run's own
+output. Stagehand emits a `Browserbase session started` line containing the unsigned
+`https://www.browserbase.com/sessions/<id>` dashboard URL at verbosity level 1. Before the eval,
+the agent runs `evals config set verbose true` in the task image so that line is emitted. If the
+command fails, the agent warns and continues; capture is best-effort and never fails the trial.
+
+Each trial records the id in two places. Agent trial metadata stores
+`browserbase_session_id`, `browserbase_session_url`, and `browserbase_session_ids` under the
+`stagehand` block; the last key contains the full list, normally of length one. The artifact
+`<trial>/agent/browserbase_session.json` stores `session_id`, `session_url`, `debug_url`, `task_id`,
+`mode`, and `all_session_ids`. Only the unsigned dashboard URL is written. No signed connect URL,
+`wss://` URL, or API key is recorded. Per-trial attribution has been verified live against the
+Browserbase API on concurrent trials.
+
+The `debug_url` field is currently always `null`. Its extractor expects a JSON-shaped
+`"debugUrl": {"value": …}` rendering, but Stagehand logs `auxiliary` fields as plain text, so the
+pattern does not match in practice. This fails safe: the field remains `null`, no signed URL is
+written, and session-id capture is unaffected. The dead extraction path should be removed or
+re-pointed at the actual log rendering.
 
 ### `BROWSERBASE_PROJECT_ID` scrubbing gap
 
